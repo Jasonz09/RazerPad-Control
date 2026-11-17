@@ -253,31 +253,6 @@ static bool SetFanMode(IntPtr h, int thermalId, int mode) {
   byte[] r;
   return TxLen(h, CMD_SET_MODE, new byte[] { 0, (byte)thermalId, (byte)mode, 0 }, 80, out r);
 }
-class CP { public int T; public int R; public CP(int t, int r) { T = t; R = r; } }
-static int RoundTo10(int v) { if (v < 10) return 10; if (v > 64) return 64; return v; }
-static int ComputeRpm(List<CP> pts, int temp, bool gpu) {
-  if (pts.Count == 0) return 500;
-  CP first = pts[0];
-  if (temp < first.T) {
-    int baseT = gpu ? 30 : 20;
-    if (first.T <= baseT) return Math.Max(500, first.R);
-    double f = (double)(temp - baseT) / (first.T - baseT);
-    double rpm = 500.0 + f * (first.R - 500.0);
-    if (rpm < 500.0) rpm = 500.0;
-    return (int)Math.Round(rpm);
-  }
-  CP last = pts[pts.Count - 1];
-  if (temp >= last.T) return last.R;
-  for (int i = 0; i < pts.Count - 1; i++) {
-    CP a = pts[i], b = pts[i + 1];
-    if (temp >= a.T && temp < b.T) {
-      if (b.T == a.T) return a.R;
-      double f = (double)(temp - a.T) / (b.T - a.T);
-      return (int)Math.Round(a.R + f * (b.R - a.R));
-    }
-  }
-  return last.R;
-}
 static PerformanceCounter _cpuPc = null;
 static string _cpuInst = null;
 static double GetCpuRaw() {
@@ -375,7 +350,10 @@ static void GpuLoop() {
             if (f.Length >= 1) { int tt; if (int.TryParse(f[0].Trim(), out tt) && tt > 0 && tt < 120 && tt > maxT) maxT = tt; }
             if (f.Length >= 2) { int uu; if (int.TryParse(f[1].Trim(), out uu) && uu >= 0 && uu <= 100 && uu > maxU) maxU = uu; }
           }
-          if (maxT > 0) gpuCache = maxT;
+          if (maxT > 0) {
+            Volatile.Write(ref gpuCache, maxT);
+            Interlocked.Exchange(ref gpuSampleTimestamp, Stopwatch.GetTimestamp());
+          }
           if (maxU >= 0) gpuLoad = maxU;
         }
       }
@@ -428,7 +406,7 @@ static void CfgChanged(object s, FileSystemEventArgs e) {
     Form current = dash;
     if (current != null && current.IsHandleCreated && !current.IsDisposed)
       current.BeginInvoke((Action)SyncDash);
-    LogCrash("hot-reload: led=" + led + " profile=" + prof + " bri=" + bri);
+    LogCrash("hot-reload: led=" + led + " profile=" + fanMode + " bri=" + bri);
   } catch { }
 }
 static volatile bool paused = false;
@@ -436,7 +414,7 @@ static volatile int curCpu = -1, curGpu = -1, curUnit = -1, curRpm = -1;
 static volatile string curStatus = "starting...";
 static volatile bool ledDirty = true;
 static volatile int lastBriApplied = -1;
-static string prof = "balanced";
+static FanMode fanMode = FanMode.Automatic;
 static string led = "heatmap";
 static string ledColor = "green";
 static int bri = 80;
@@ -445,49 +423,23 @@ static int critical = 85;
 static readonly object cfgLock = new object();
 static bool keepOnExit = false;
 // ---------- v3 additions ----------
-static int maxStep = 6;            // fan-unit change limit per loop (0 = instant, no smoothing)
-static bool autoTurbo = true;      // sustained very-high temp forces a timed max-fan cooling run
 static bool idleDim = true;        // dim the light bar while the laptop is cool/idle
 static bool nightDim = false;      // dim the light bar between 22:00 and 07:00
 const int IDLE_BRI = 25;
 const int NIGHT_BRI = 25;
-const int TURBO_MS = 120000;       // duration of a manual "Turbo burst" (2 minutes)
-static int manualTurboUntil;      // Environment.TickCount deadline
 static volatile string fanOverride = "";
 static double gpuCache = -1;       // latest GPU temp from the background sampler
+static long gpuSampleTimestamp;
 static double gpuLoad = -1;        // latest GPU utilisation % from nvidia-smi
 static double cpuLoad = -1;        // latest CPU utilisation % from PDH
 static Thread gpuThread;                    // background sensor sampler
 static Thread ledThread;                    // smooth lighting driver
 static readonly object hidLock = new object();  // serialise every HID feature write
-static bool loadBoost = true;               // pre-raise the fan on heavy load, before temp spikes
-static int rpmCap = 2300;            // fan-wear cap: hold fan at/below this rpm while cool (0 = off)
-static int capTemp = 60;             // at/above this temp the wear cap lifts (fan may exceed rpmCap)
-static int deadband = 3;             // ignore target changes smaller than this (~150rpm) => steady speed
-static int downHold = 6;             // loops a LOWER target must persist (6 x 2s = 12s) before the fan actually slows
 static bool coolTail = true;         // gradually slow the fan to a stop on exit once hardware is cool
 static int coolTemp = 45;            // target temperature for the exit cool-down tail
 static bool hyperBoost = false;      // v7: lift OS power-saver caps (PCIe ASPM / USB suspend) for max GPU throughput
 // ---------- v8 additions ----------
-static bool manual = false;            // manual fan mode: a fixed user-set speed, bypassing the temp curve
 static int manualUnit = 30;            // manual fan speed in raw units (10-64 -> ~500-3200rpm)
-// ---------- v8 thermal model (auto mode: hold a CONSTANT speed, move only when it is truly needed) ----------
-static double pidI = 0;              // integral of the temperature error: the term that FINDS the holding speed
-static double emaT = -1;             // low-pass filter over the raw sensor so noise can never twitch the fan
-static int lastMeas = -1;            // previous smoothed temp -> gives the heating/cooling rate (derivative)
-static double lastDeriv = 0;
-const double emaAlphaFor = 0.12;   // filter coefficient used in Steady mode: ~17s time constant, absorbs sensor jitter
-static double emaAlpha = 0.35;          // current filter coefficient (ApplySmooth lowers it in Steady mode)
-// Integral-dominant control is deliberate. A pure P/PI controller over-responds to the sensor noise on this
-// pad, which is exactly the "sped up and slowed down every few seconds" symptom. The integral accumulates
-// only while the temperature is inside the safe band, so the fan settles onto the LOWEST speed that holds
-// the temperature and then sits there instead of chasing every wiggle.
-const double Kp = 0.3;                    // fan units per degree of error
-const double Ki = 0.02;                   // fan units per degree-second (slow, steady authority)
-const double Kd = 1.4;                    // only active while WARMING (damps overshoot); ignored while cooling
-const double IBAND_LO = 40, IBAND_HI = 80; // integrate only inside this band (no windup when cold / critical)
-const double IMAX = 14;                   // anti-windup clamp on the integral correction (+/-14 units = +/-700rpm)
-static int coast = 15;                  // anti-hunt: seconds the fan waits before easing DOWN one unit (slow coast-down, prevents pump up/down oscillation)
 // ---------- Compact Graphite dashboard ----------
 static Form dash;                      // the dashboard window (null = not open)
 static bool exiting = false;           // set when the user truly exits (so closing the window quits)
@@ -496,62 +448,15 @@ static Label lblCpu, lblGpu, lblHead, lblRpm;   // live read-outs
 static TrackBar tbFan, tbBri;          // manual fan speed + LED brightness
 static Label lblFanVal, lblBriVal;     // slider value captions
 static Panel lightingPreview;
-static CheckBox ckAutoTurbo, ckLoadBoost, ckWearCap, ckSteady, ckCoolTail, ckIdleDim, ckNightDim, ckHyper; // option toggles
-static RoundedButton btnTurbo, btnPause;
+static CheckBox ckCoolTail, ckIdleDim, ckNightDim, ckHyper;
+static RoundedButton btnPause;
 static bool dashSyncing = false;       // guard: suppress slider/toggle events while refreshing the UI
 static List<RoundedButton> profBtns = new List<RoundedButton>();
-static TrackBar tbSmooth;              // fan steadiness: how hard the controller resists speed changes
-static Label lblSmoothVal;
 static CheckBox ckAutoStart;           // start the controller when Windows starts
-static int smooth = 45;                // 0 = jumps at once ... 100 = very lazy / rock steady
 static bool openOnStart = true;      // show the dashboard when launched by hand; the logon autostart passes --minimized
-static bool NotExpired(int now, int until) {
-  if (until == 0) return false;
-  return unchecked(until - now) > 0;  // elapsed arithmetic also works across TickCount rollover
-}
 // device handle shared between the worker and menu actions (only the worker touches it)
 static IntPtr devH = new IntPtr(-1);
 static int fanId = 5;
-// Maps a single 0-100 "steadiness" slider onto the three real anti-hunt knobs.
-//   deadband  = how big a change has to be before we act (rpm jitter gate)
-//   downHold  = how long a LOWER target must persist before we slow down (seconds / interval)
-//   coast     = seconds between each single-step reduction (how lazily we ease down)
-static void ApplySmooth(int v) {
-  if (v < 0) v = 0; if (v > 100) v = 100;
-  smooth = v;
-  deadband = 1 + v / 20;                    // 1 .. 6 units (50..300 rpm)
-  if (v <= 2) emaAlpha = 0.35; else emaAlpha = 0.30 - v * 0.18 / 100;   // instant=reactive, steady=heavily damped
-  downHold = (2 + v / 10) * 1000 / (interval < 500 ? 500 : interval);   // ~2s .. 12s of hold
-  if (downHold < 1) downHold = 1;
-  coast = 5 + v * 35 / 100;                 // 5 .. 40 seconds per 1-unit reduction
-  emaAlpha = emaAlphaFor;                       // steady default -> slow, noise-immune filter; instant -> fast
-}
-static List<CP> ProfileCurve(string p, out int fixedU, out int rMin, out int rMax) {
-  fixedU = -1; rMin = 500; rMax = 3200;
-  List<CP> pts = new List<CP>();
-  switch (p) {
-    case "quiet":
-      rMax = 2100;
-      pts.Add(new CP(45, 900)); pts.Add(new CP(55, 1200)); pts.Add(new CP(65, 1600));
-      pts.Add(new CP(75, 1900)); pts.Add(new CP(85, 2000)); pts.Add(new CP(95, 2100));
-      break;
-    case "performance":
-      pts.Add(new CP(40, 1500)); pts.Add(new CP(50, 2000)); pts.Add(new CP(60, 2400));
-      pts.Add(new CP(70, 2800)); pts.Add(new CP(80, 3100)); pts.Add(new CP(90, 3200));
-      break;
-    case "turbo":
-      fixedU = 64;
-      pts.Add(new CP(45, 3200));
-      break;
-    case "balanced":
-    default:
-      pts.Add(new CP(45, 1000)); pts.Add(new CP(55, 1500)); pts.Add(new CP(65, 2000));
-      pts.Add(new CP(75, 2500)); pts.Add(new CP(85, 2900)); pts.Add(new CP(95, 3200));
-      break;
-  }
-  return pts;
-}
-
 static bool Reopen() {
   lock (hidLock) {
     lightingOutput = null;
@@ -911,7 +816,6 @@ static void ApplyHyperBoost(bool on) {
         d[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
       }
       string sv;
-      if (d.TryGetValue("profile", out sv) && !string.IsNullOrEmpty(sv)) prof = sv.ToLowerInvariant();
       if (d.TryGetValue("led", out sv) && !string.IsNullOrEmpty(sv)) led = sv.ToLowerInvariant();
       if (d.TryGetValue("ledcolor", out sv) && !string.IsNullOrEmpty(sv)) ledColor = sv;
       // accept the combined "static:red" / "static:FF0000" syntax in the cfg file too
@@ -924,25 +828,16 @@ static void ApplyHyperBoost(bool on) {
       ReadEffectLibrary(d);
       interval = GetInt(d, "interval", interval);
       critical = GetInt(d, "critical", critical);
-      maxStep = GetInt(d, "maxstep", maxStep);
-      autoTurbo = GetBool(d, "autoturbo", autoTurbo);
       idleDim = GetBool(d, "idledim", idleDim);
       nightDim = GetBool(d, "nightdim", nightDim);
-      loadBoost = GetBool(d, "loadboost", loadBoost);
       keepOnExit = GetBool(d, "keeponexit", keepOnExit);
-      rpmCap = GetInt(d, "rpmcap", rpmCap);
-      capTemp = GetInt(d, "captemp", capTemp);
-      deadband = GetInt(d, "deadband", deadband);
-      downHold = GetInt(d, "downhold", downHold);
       coolTail = GetBool(d, "cooltail", coolTail);
       coolTemp = GetInt(d, "cooltemp", coolTemp);
       hyperBoost = GetBool(d, "hyperboost", hyperBoost);
-      manual = GetBool(d, "manual", manual);
+      bool hasProfile = d.TryGetValue("profile", out sv);
+      FanMode savedMode = hasProfile ? ParseFanMode(sv) : fanMode;
+      fanMode = GetBool(d, "manual", savedMode == FanMode.Manual) ? FanMode.Manual : savedMode;
       manualUnit = GetInt(d, "manualunit", manualUnit);
-      coast = GetInt(d, "coast", coast);
-      // The steadiness slider is the single source of truth for the three anti-hunt knobs.
-      int sm = GetInt(d, "smooth", -1);
-      if (sm >= 0) ApplySmooth(sm);
     } catch { }
   }
 }
@@ -955,29 +850,20 @@ static bool SaveConfig() {
       var lines = new List<string> {
         "; RazerPadTray settings - edited automatically when you use the tray menu.",
         "; The old CLI keeps its own autostart.cfg; this file only configures the tray app.",
-        "profile=" + prof,
+        "profile=" + fanMode.ToString().ToLowerInvariant(),
         "led=" + led,
         "ledcolor=" + ledColor,
         "bri=" + bri,
         "interval=" + interval,
         "critical=" + critical,
-        "maxstep=" + maxStep,
-        "autoturbo=" + (autoTurbo ? "true" : "false"),
         "idledim=" + (idleDim ? "true" : "false"),
         "nightdim=" + (nightDim ? "true" : "false"),
-        "loadboost=" + (loadBoost ? "true" : "false"),
         "keeponexit=" + (keepOnExit ? "true" : "false"),
-        "rpmcap=" + rpmCap,
-        "captemp=" + capTemp,
-        "deadband=" + deadband,
-        "downhold=" + downHold,
         "cooltail=" + (coolTail ? "true" : "false"),
         "cooltemp=" + coolTemp,
         "hyperboost=" + (hyperBoost ? "true" : "false"),
-        "manual=" + (manual ? "true" : "false"),
+        "manual=" + (fanMode == FanMode.Manual ? "true" : "false"),
         "manualunit=" + manualUnit,
-        "coast=" + coast,
-        "smooth=" + smooth
       };
       foreach (var entry in effectColors) lines.Add("color." + entry.Key + "=" + entry.Value);
       WriteEffectLibrary(lines);
@@ -993,193 +879,88 @@ static bool SaveConfig() {
   }
 }
 static void WorkerLoop() {
-  int loopN = 0, ledPhase = 0, lastLedMs = 0, lastBlinkMs = 0;
-  bool critOn = false;
-  int lastApplied = -1, failCount = 0, hotStreak = 0, pendingUnit = -1, pendingCnt = 0, holdUnit = -1, decayCnt = 0, loadStreak = 0; int lastSentUnit = -1; int lastSentMs = 0; string profPrev = prof + (manual ? "|manual" : "");
-  bool autoTurboOn = false, burstWasActive = false;
-  string appliedSig = "";
+  var controller = new FanController();
+  var clock = Stopwatch.StartNew();
+  int failCount = 0, lastSentUnit = -1;
+  long lastSentAt = 0;
   while (_run) {
-   try {
-    int loopStart = Environment.TickCount;
-    if (devH == new IntPtr(-1)) {
-      curStatus = "pad not found (retrying...)";
-      curUnit = curRpm = -1;
-      fanOverride = "";
-      WriteStatus();
-      lastApplied = -1; appliedSig = ""; lastBriApplied = -1; pidI = 0; emaT = -1; lastMeas = -1; lastDeriv = 0; lastSentUnit = -1; lastSentMs = 0;
-      if (!Reopen()) { for (int s = 0; s < 30 && _run; s++) Thread.Sleep(100); continue; }
-    }
-    IntPtr h = devH;
-    double cpuT = GetCpuRaw();
-    double gpuT = gpuCache;   // background sampler; never blocks the worker on nvidia-smi
-    cpuLoad = GetCpuLoad();   // cheap PDH read
-    curCpu = cpuT < 0 ? -1 : (int)Math.Round(cpuT);
-    curGpu = gpuT < 0 ? -1 : (int)Math.Round(gpuT);
-
-    string mp, ml, mc; int mb, mi, mcr, ms, mcap, mcapT, mdb, mdh; bool pz, at, lb, man; int mu; string profWas = profPrev;
-    lock (cfgLock) { mp = prof; ml = led; mc = ledColor; mb = bri; mi = interval; mcr = critical; pz = paused; at = autoTurbo; ms = maxStep; lb = loadBoost; mcap = rpmCap; mcapT = capTemp; mdb = deadband; mdh = downHold; man = manual; mu = manualUnit; }
-
-    if (pz) {
-      curStatus = "paused"; WriteStatus();
-      for (int s = 0; s < 10 && _run; s++) Thread.Sleep(100);
-      continue;
-    }
-
-    double useRaw = Math.Max(cpuT, gpuT);
-    // Low-pass the sensor. Without this, +-1C jitter is enough to push the target across the deadband and
-    // the fan twitches constantly. EMA with alpha=0.35 over a 2s loop -> ~6s time constant.
-    if (useRaw < 0) {
-      // no reading this loop: keep the last estimate, drift it slowly toward the curve so we never freeze forever
-      if (emaT < 0) emaT = useRaw; else emaT = emaT - 0.05;
-    } else if (emaT < 0) emaT = useRaw;
-    else { double prev = emaT; emaT = emaT + emaAlpha * (useRaw - emaT); lastDeriv = emaT - prev; }
-    double use = emaT;
-    int now = Environment.TickCount;
-    bool crit = (use >= mcr);
-
-    // ---- auto-turbo: sustained very-hot temps force a max-fan cooling run, then release ----
-    int trigT = mcr - 5; if (trigT < 55) trigT = 55;
-    int relT = trigT - 10; if (relT < 40) relT = 40;
-    if (use >= trigT) { hotStreak++; if (hotStreak >= 4) autoTurboOn = true; }
-    else if (use >= 0 && use <= relT) { hotStreak = 0; autoTurboOn = false; }
-    int burstDeadline = Volatile.Read(ref manualTurboUntil);
-    bool manualTurbo = NotExpired(now, burstDeadline);
-    if (burstDeadline != 0 && !manualTurbo)
-      Interlocked.CompareExchange(ref manualTurboUntil, 0, burstDeadline);
-    bool burstEnded = burstWasActive && !manualTurbo;
-    burstWasActive = manualTurbo;
-
-    int fixedU, rmin, rmax;
-    List<CP> pts = ProfileCurve(mp, out fixedU, out rmin, out rmax);
-    if (man) fixedU = mu;
-    int unit; bool forceMax = false;
-    string overrideReason = crit ? "Critical temperature" : manualTurbo ? "Turbo Burst" :
-                            at && autoTurboOn ? "Auto-Turbo" : "";
-    if (overrideReason.Length != 0) { unit = MAX_UNIT; forceMax = true; }
-    else if (fixedU >= 0) unit = fixedU;
-    else if (use < 0) unit = lastApplied < 0 ? 30 : lastApplied;
-    else {
-      int rpm = ComputeRpm(pts, (int)Math.Round(use), true);
-      if (rpm < rmin) rpm = rmin;
-      if (rpm > rmax) rpm = rmax;
-      unit = RoundTo10(rpm / FACTOR);
-
-      // ---- closed-loop correction on top of the curve (this is what kills the hunting) ----
-      // The curve alone is open-loop: it re-reads a lagging sensor every 2s, so the fan chases the
-      // rebound and pumps up and down. Here we aim at a temperature SETPOINT instead. The feed-forward
-      // curve already gets us close; the integral term then trims up/down until the temperature holds
-      // steady, and once it is holding, the integral stops moving -> the fan sits at ONE constant speed.
-      double sp = 75;                       // default setpoint (balanced)
-      if (mp == "quiet") sp = 80;
-      else if (mp == "performance") sp = 68;
-      else if (mp == "turbo") sp = 60;
-      double err = use - sp;
-      double dtS = (mi < 500 ? 500 : mi) / 1000.0;
-      if (use >= IBAND_LO && use <= IBAND_HI) {
-        pidI = pidI + Ki * err * dtS;
-        if (pidI > IMAX) pidI = IMAX; if (pidI < -IMAX) pidI = -IMAX;
+    try {
+      long loopStart = clock.ElapsedMilliseconds;
+      if (devH == new IntPtr(-1)) {
+        curStatus = "pad not found (retrying...)";
+        curUnit = curRpm = -1;
+        fanOverride = "";
+        WriteStatus();
+        lastSentUnit = -1;
+        if (!Reopen()) { WaitForFanLoop(clock, loopStart, 3000); continue; }
       }
-      double corr = Kp * err + pidI;
-      // D term: only when the hardware is still WARMING, so we react early and damp overshoot.
-      if (lastDeriv > 0.1) corr += Kd * lastDeriv;
-      unit = RoundTo10((int)Math.Round(unit + corr));
-    }
-    // Switching profile (or entering/leaving manual mode) changes the whole target: forget the old
-    // closed-loop trim so the new mode starts from its own curve instead of inheriting a stale correction.
-    string modeSig = mp + (man ? "|manual" : "");
-    if (modeSig != profWas) { pidI = 0; emaT = -1; decayCnt = 0; pendingCnt = 0; profPrev = modeSig; }
+      IntPtr device = devH;
+      double cpu = GetCpuRaw();
+      long gpuAt = Interlocked.Read(ref gpuSampleTimestamp);
+      double gpu = gpuAt != 0 && Stopwatch.GetTimestamp() - gpuAt <= 12 * Stopwatch.Frequency
+        ? Volatile.Read(ref gpuCache) : -1;
+      cpuLoad = GetCpuLoad();
+      curCpu = FanController.ValidTemperature(cpu) ? (int)Math.Round(cpu) : -1;
+      curGpu = FanController.ValidTemperature(gpu) ? (int)Math.Round(gpu) : -1;
 
-    // ---- load-aware pre-emptive boost: if CPU/GPU is working hard, raise the fan floor
-    // BEFORE the temperature has had time to climb, so the pad reacts ahead of the spike ----
-    if (lb && !forceMax && fixedU < 0 && use >= 0) {
-      double cl = cpuLoad; double gl = gpuLoad;
-      int hot = Math.Max(cl < 0 ? 0 : (int)cl, gl < 0 ? 0 : (int)gl);
-      // Require the load to PERSIST before lifting the floor. A single busy 2s sample (indexer,
-      // antivirus, browser blink) used to slam the fan up and then down again - visible flapping.
-      if (hot >= 55) loadStreak++; else if (hot < 30) loadStreak = 0;
-      if (loadStreak >= 3) {
-        if (hot >= 90) { int floor = MAX_UNIT; if (floor > unit) unit = floor; }
-        else if (hot >= 65) { int floor = 46; if (floor > unit) unit = floor; }
-        else if (hot >= 40) { int floor = 38; if (floor > unit) unit = floor; }
+      FanMode mode;
+      int target, sampleInterval;
+      lock (cfgLock) {
+        mode = fanMode;
+        target = manualUnit;
+        sampleInterval = Limit(interval, 500, 2000);
       }
-    }
+      if (paused) {
+        curStatus = "paused";
+        WriteStatus();
+        WaitForFanLoop(clock, loopStart, 1000);
+        continue;
+      }
 
-    // ---- fan-wear cap: while the hardware is COOL, hold the fan at or below a gentle ceiling
-    // (default 2300 rpm) to protect the bearing. As soon as temp reaches capTemp (or critical /
-    // turbo), the cap lifts and the curve/critical decide the real speed, so cooling never suffers. ----
-    if (!forceMax && fixedU < 0 && mcap > 0 && use >= 0 && use < mcapT) {
-      int capU = mcap / FACTOR; if (capU < MIN_UNIT) capU = MIN_UNIT; if (capU > MAX_UNIT) capU = MAX_UNIT;
-      if (unit > capU) unit = capU;
-    }
-
-    // ---- smooth ramp: cap how many fan-units we change per loop (anti-flap, quieter) ----
-    // ---- stability filter: hold a CONSTANT speed and only move when it is genuinely needed. ----
-    //  * a deadband ignores tiny target jitter (sensor noise) so the fan does not flutter every second;
-    //  * upward moves happen promptly (cool first);
-    //  * downward moves only take effect after the lower target has HELD for downHold loops, so the
-    //    fan stays up after a load ends and eases back down gradually instead of pumping up and down.
-    // ---- high-water-mark coast controller (anti-hunt).
-    // The thermal system lags: if the fan drops speed the instant the temp dips, the temp
-    // rebounds a second later and the fan pumps back up -> the up/down oscillation we want to kill.
-    // Fix: remember a high-water mark of recent cooling demand. Climb PROMPTLY when it gets hot,
-    // but only ease DOWN slowly (1 unit per coast seconds), and freeze entirely inside the deadband.
-    int delta = unit - lastApplied;
-    int decayLoops = coast * 1000 / (mi < 500 ? 500 : mi); if (decayLoops < 1) decayLoops = 1;
-    if (forceMax || burstEnded || lastApplied < 0 || fixedU >= 0) {
-      lastApplied = unit; holdUnit = unit; decayCnt = 0;
-    } else if (ms <= 0) {
-      lastApplied = unit; holdUnit = unit; decayCnt = 0;
-    } else if (delta >= mdb) {
-      // clearly hotter: ramp up promptly (respect the per-loop step limit) and lift the high-water mark
-      lastApplied = Math.Min(unit, lastApplied + ms);
-      if (holdUnit < lastApplied) holdUnit = lastApplied;
-      decayCnt = 0;
-    } else if (delta <= -mdb) {
-      // clearly cooler: hold the high-water mark, creep down 1 unit per coast interval
-      if (lastDeriv > 0.12) { decayCnt = 0; }   // still warming -> do not start easing down yet
-      else pendingCnt++;
-      if (pendingCnt >= (mdh < 1 ? 1 : mdh)) {
-        decayCnt++;
-        if (decayCnt >= decayLoops) {
-          decayCnt = 0;
-          if (holdUnit > unit) holdUnit--;
-          if (holdUnit < unit) holdUnit = unit;
+      long now = clock.ElapsedMilliseconds;
+      int command = controller.Update(now, cpu, gpu, mode, target);
+      bool heartbeat = lastSentUnit < 0 || now - lastSentAt >= 15000;
+      bool fanOk = true;
+      if (command != lastSentUnit || heartbeat) {
+        lock (hidLock) {
+          if (heartbeat && GetFanMode(device, fanId) != 1) SetFanMode(device, fanId, 1);
+          fanOk = SetFanSpeed(device, fanId, command);
         }
-        lastApplied = holdUnit;
+        if (fanOk) { lastSentUnit = command; lastSentAt = now; }
       }
-    } else {
-      // inside deadband: freeze speed and coast timer (ignore sensor noise)
-      decayCnt = 0;
+      if (fanOk) {
+        failCount = 0;
+        curUnit = command;
+        curRpm = command * FACTOR;
+      } else {
+        curUnit = curRpm = -1;
+        lastSentUnit = -1;
+        if (++failCount >= 3) { failCount = 0; Reopen(); }
+      }
+
+      fanOverride = !controller.HasTemperature ? "Temperature unavailable · holding speed" :
+                    controller.Emergency ? "Temperature override active" : "";
+      curStatus = "CPU " + (curCpu < 0 ? "n/a" : curCpu + "C") +
+                  "  GPU " + (curGpu < 0 ? "n/a" : curGpu + "C") +
+                  "  Fan " + (curRpm < 0 ? "n/a" : curRpm.ToString()) + "rpm" +
+                  (fanOverride.Length == 0 ? "" : "  [" + fanOverride + "]");
+      WriteStatus();
+      WaitForFanLoop(clock, loopStart, sampleInterval);
+    } catch (Exception error) {
+      LogCrash("worker loop: " + error);
+      WaitForFanLoop(clock, clock.ElapsedMilliseconds, 1000);
     }
-    int cmd = lastApplied;
-    bool fanOk;
-    bool speedChanged = (cmd != lastSentUnit) || (now - lastSentMs > 15000);   // change OR 15s heartbeat
-    if (speedChanged) { lock (hidLock) { fanOk = SetFanSpeed(h, fanId, cmd); } if (fanOk) { lastSentUnit = cmd; lastSentMs = now; } }
-    else fanOk = true;
-    if (fanOk) { failCount = 0; curUnit = cmd; curRpm = cmd * FACTOR; }
-    else {
-      failCount++; curUnit = -1; curRpm = -1;
-      if (failCount >= 3) { lastApplied = -1; appliedSig = ""; lastBriApplied = -1; lastSentUnit = -1; lastSentMs = 0; pidI = 0; Reopen(); }
-    }
-
-    // Synapse steals manual mode; re-assert it periodically
-    if (++loopN % 10 == 0) { lock (hidLock) { try { int m = GetFanMode(h, fanId); if (m != 1) SetFanMode(h, fanId, 1); } catch { } } }
-
-    // ---------- lighting is driven by the dedicated LedLoop thread (smooth ~25fps) ----------
-
-    fanOverride = overrideReason;
-    bool turboShow = forceMax && !crit;
-    curStatus = "CPU " + (cpuT < 0 ? "n/a" : cpuT.ToString("0") + "C") +
-                "  GPU " + (gpuT < 0 ? "n/a" : gpuT.ToString("0") + "C") +
-                "  Fan " + (curRpm < 0 ? "n/a" : curRpm.ToString()) + "rpm" +
-                (crit ? "  [HOT]" : (turboShow ? "  [TURBO]" : ""));
-    WriteStatus();
-    int wait = mi < 500 ? 500 : mi;
-    int sleep = wait - (Environment.TickCount - loopStart);
-    while (sleep > 0 && _run) { int step = sleep > 150 ? 150 : sleep; Thread.Sleep(step); sleep -= step; }
-   } catch (Exception wex) { try { LogCrash("worker loop: " + wex.Message + " | " + wex.StackTrace); } catch { } for (int s9 = 0; s9 < 10 && _run; s9++) Thread.Sleep(100); }
   }
 }
+
+static void WaitForFanLoop(Stopwatch clock, long start, int intervalMs) {
+  long remaining = intervalMs - (clock.ElapsedMilliseconds - start);
+  while (remaining > 0 && _run) {
+    Thread.Sleep((int)Math.Min(remaining, 150));
+    remaining = intervalMs - (clock.ElapsedMilliseconds - start);
+  }
+}
+
 static System.Drawing.Icon MakeIcon(int temp) {
   Bitmap bmp = new Bitmap(32, 32);
   using (Graphics g = Graphics.FromImage(bmp)) {
@@ -1217,13 +998,14 @@ static List<ToolStripMenuItem> briItems = new List<ToolStripMenuItem>();
 static void CheckGroup(List<ToolStripMenuItem> g, string tag) {
   foreach (var it in g) it.Checked = (string.Equals((string)it.Tag, tag, StringComparison.OrdinalIgnoreCase));
 }
-static void FanClick(object s, EventArgs e) {
-  ToolStripMenuItem mi = (ToolStripMenuItem)s;
-  lock (cfgLock) { prof = (string)mi.Tag; manual = false; }
-  CheckGroup(fanItems, (string)mi.Tag);
-  ledDirty = true;
+static void SelectFanMode(FanMode mode) {
+  lock (cfgLock) fanMode = mode;
+  CheckGroup(fanItems, mode.ToString());
   SaveConfig();
   SyncDash();
+}
+static void FanClick(object s, EventArgs e) {
+  SelectFanMode(ParseFanMode((string)((ToolStripMenuItem)s).Tag));
 }
 static void LedClick(object s, EventArgs e) {
   ToolStripMenuItem mi = (ToolStripMenuItem)s;
@@ -1253,7 +1035,6 @@ static void BriClick(object s, EventArgs e) {
 }
 static void PauseClick(object s, EventArgs e) {
   paused = !paused;
-  if (paused) Volatile.Write(ref manualTurboUntil, 0);
   if (pauseItem != null) {
     pauseItem.Checked = paused;
     pauseItem.Text = paused ? "Resume automation" : "Pause automation";
@@ -1261,27 +1042,6 @@ static void PauseClick(object s, EventArgs e) {
   SyncDash();
   DashTick(null, EventArgs.Empty);
   ledDirty = true;
-}
-static void TurboBurstClick(object s, EventArgs e) {
-  if (paused) return;
-  int now = Environment.TickCount;
-  int deadline = unchecked(now + TURBO_MS);
-  int currentDeadline = Volatile.Read(ref manualTurboUntil);
-  Volatile.Write(ref manualTurboUntil, NotExpired(now, currentDeadline) ? 0 : (deadline == 0 ? 1 : deadline));
-  DashTick(null, EventArgs.Empty);
-}
-static void AutoTurboClick(object s, EventArgs e) {
-  ToolStripMenuItem mi = (ToolStripMenuItem)s;
-  autoTurbo = !autoTurbo;
-  mi.Checked = autoTurbo;
-  if (!autoTurbo) { lock (cfgLock) { } }
-  SaveConfig();
-}
-static void LoadBoostClick(object s, EventArgs e) {
-  ToolStripMenuItem mi = (ToolStripMenuItem)s;
-  loadBoost = !loadBoost;
-  mi.Checked = loadBoost;
-  SaveConfig();
 }
 static void IdleDimClick(object s, EventArgs e) {
   ToolStripMenuItem mi = (ToolStripMenuItem)s;
@@ -1295,19 +1055,6 @@ static void NightDimClick(object s, EventArgs e) {
   nightDim = !nightDim;
   mi.Checked = nightDim;
   ledDirty = true;
-  SaveConfig();
-}
-static int lastRpmCap = 2300;
-static void WearCapClick(object s, EventArgs e) {
-  ToolStripMenuItem mi = (ToolStripMenuItem)s;
-  if (rpmCap > 0) { lastRpmCap = rpmCap; rpmCap = 0; mi.Checked = false; }
-  else { rpmCap = lastRpmCap > 0 ? lastRpmCap : 2300; mi.Checked = true; }
-  SaveConfig();
-}
-static void SteadyClick(object s, EventArgs e) {
-  ToolStripMenuItem mi = (ToolStripMenuItem)s;
-  ApplySmooth(smooth > 0 ? 0 : 45);   // 0 = instant/reactive, 45 = the recommended steady default
-  mi.Checked = (smooth > 0);
   SaveConfig();
 }
 static void CoolTailClick(object s, EventArgs e) {
@@ -1369,39 +1116,21 @@ static ContextMenuStrip BuildMenu() {
   openItem.Click += new EventHandler(delegate (object s2, EventArgs e2) { ShowDashboard(); });
   m.Items.Add(openItem);
   m.Items.Add(new ToolStripSeparator());
-  ToolStripMenuItem fan = new ToolStripMenuItem("Fan profile");
-  fan.DropDownItems.Add(Radio(ref fanItems, "Quiet", "quiet", new EventHandler(FanClick)));
-  fan.DropDownItems.Add(Radio(ref fanItems, "Balanced (default)", "balanced", new EventHandler(FanClick)));
-  fan.DropDownItems.Add(Radio(ref fanItems, "Performance", "performance", new EventHandler(FanClick)));
-  fan.DropDownItems.Add(Radio(ref fanItems, "Turbo (max)", "turbo", new EventHandler(FanClick)));
-  fan.DropDownItems.Add(new ToolStripSeparator());
-  ToolStripMenuItem burst = new ToolStripMenuItem("Turbo burst for 2 minutes");
-  burst.Click += new EventHandler(TurboBurstClick);
-  fan.DropDownItems.Add(burst);
-  ToolStripMenuItem at = new ToolStripMenuItem("Auto-turbo when very hot");
-  at.Checked = autoTurbo;
-  at.Click += new EventHandler(AutoTurboClick);
-  fan.DropDownItems.Add(at);
-  ToolStripMenuItem lbt = new ToolStripMenuItem("Boost fan ahead of heavy load");
-  lbt.Checked = loadBoost;
-  lbt.Click += new EventHandler(LoadBoostClick);
-  fan.DropDownItems.Add(lbt);
-  ToolStripMenuItem wct = new ToolStripMenuItem("Protect fan: cap at 2300rpm until hot");
-  wct.Checked = (rpmCap > 0);
-  wct.Click += new EventHandler(WearCapClick);
-  fan.DropDownItems.Add(wct);
-  ToolStripMenuItem sdy = new ToolStripMenuItem("Steady speed (anti-flap)");
-  sdy.Checked = (deadband > 0 && downHold > 1);
-  sdy.Click += new EventHandler(SteadyClick);
-  fan.DropDownItems.Add(sdy);
-  ToolStripMenuItem ctl = new ToolStripMenuItem("Wind fan down gently on exit");
-  ctl.Checked = coolTail;
-  ctl.Click += new EventHandler(CoolTailClick);
-  fan.DropDownItems.Add(ctl);  ToolStripMenuItem hbt = new ToolStripMenuItem("Max performance (HyperBoost)");
-  hbt.Checked = hyperBoost;
-  hbt.Click += new EventHandler(HyperBoostClick);
-  fan.DropDownItems.Add(hbt);
+  var fan = new ToolStripMenuItem("Fan mode");
+  foreach (FanMode mode in Enum.GetValues(typeof(FanMode))) {
+    string name = mode.ToString();
+    fan.DropDownItems.Add(Radio(ref fanItems, name, name, FanClick));
+  }
   m.Items.Add(fan);
+
+  var device = new ToolStripMenuItem("Device settings");
+  var coolDown = new ToolStripMenuItem("Wind fan down gently on exit") { Checked = coolTail };
+  coolDown.Click += CoolTailClick;
+  device.DropDownItems.Add(coolDown);
+  var boost = new ToolStripMenuItem("HyperBoost") { Checked = hyperBoost };
+  boost.Click += HyperBoostClick;
+  device.DropDownItems.Add(boost);
+  m.Items.Add(device);
 
   ToolStripMenuItem lm = new ToolStripMenuItem("Lighting");
   lm.DropDownItems.Add(Radio(ref ledItems, "Heatmap (temp)", "heatmap", new EventHandler(LedClick)));
@@ -1467,12 +1196,11 @@ static void UiTick(object s, EventArgs e) {
   string tip = head + "\n" + bodyTxt;
   if (tip.Length > 63) tip = tip.Substring(0, 63);
   tray.Text = tip;
-  string iconSig = (paused ? "P" : "") + ((!string.IsNullOrEmpty(curStatus) && curStatus.Contains("[TURBO]")) ? "T" : "") + ":" + (paused ? -1 : t);
+  string iconSig = (paused ? "P" : "") + ":" + (paused ? -1 : t);
   if (iconSig != lastIconSig) {
     lastIconSig = iconSig;
     int ic = t;
     if (paused) ic = -1;
-    else if (!string.IsNullOrEmpty(curStatus) && curStatus.Contains("[TURBO]")) ic = 95;
     try {
       System.Drawing.Icon old = tray.Icon;
       tray.Icon = MakeIcon(ic);
@@ -1491,8 +1219,8 @@ static readonly Color GraphitePanel = Color.FromArgb(23, 23, 37);
 static readonly Color GraphiteBorder = Color.FromArgb(64, 60, 85);
 static readonly Color GraphiteAccent = Color.FromArgb(175, 129, 255);
 static readonly Color SurfaceEdge = Color.FromArgb(54, 51, 73);
-static Panel automaticControls, manualControls, turboControls, lightingOptions;
-static Label overrideStatus, deviceConnection, lightingStatus;
+static Panel manualControls, lightingOptions;
+static Label fanModeSummary, overrideStatus, deviceConnection, lightingStatus;
 static FanHistory coolingHistory;
 static ToolStripMenuItem pauseItem;
 
@@ -2262,7 +1990,7 @@ static Color ParseHex(string hex) {
 static void FanSliderChanged(object s, EventArgs e) {
   if (dashSyncing) return;
   int v = tbFan.Value;
-  lock (cfgLock) { manualUnit = v; manual = true; }
+  lock (cfgLock) manualUnit = v;
   SaveConfig();
   if (lblFanVal != null) lblFanVal.Text = (v * FACTOR).ToString("N0") + " RPM";
 }
@@ -2275,22 +2003,16 @@ static void BriSliderChanged(object s, EventArgs e) {
   if (lblBriVal != null) lblBriVal.Text = v.ToString() + "%";
   if (lightingPreview != null) lightingPreview.Invalidate();
 }
-static void SmoothChanged(object s, EventArgs e) {
-  if (dashSyncing) return;
-  ApplySmooth(tbSmooth.Value);
-  lblSmoothVal.Text = smooth + "%";
-  dashSyncing = true;
-  try { ckSteady.Checked = deadband > 0 && downHold > 1; }
-  finally { dashSyncing = false; }
-  SaveConfig();
-}
 static void SyncDash() {
   if (dash == null || dash.IsDisposed) return;
   try {
     dashSyncing = true;
+    FanMode currentMode;
+    lock (cfgLock) currentMode = fanMode;
+    CheckGroup(fanItems, currentMode.ToString());
     foreach (RoundedButton button in profBtns) {
       string key = (string)button.Tag;
-      bool selected = manual ? key == "manual" : string.Equals(prof, key, StringComparison.OrdinalIgnoreCase);
+      bool selected = string.Equals(currentMode.ToString(), key, StringComparison.OrdinalIgnoreCase);
       button.Quiet = !selected;
       button.RadioSelected = selected;
       button.FillColor = selected ? Color.FromArgb(45, 32, 75) : GraphitePanel;
@@ -2298,29 +2020,19 @@ static void SyncDash() {
       button.ForeColor = selected ? GraphiteAccent : Color.White;
       button.AccessibleDescription = selected ? "Selected fan profile" : "";
     }
-    bool automatic = !manual && prof != "turbo";
-    automaticControls.Visible = automatic;
-    manualControls.Visible = manual;
-    turboControls.Visible = !manual && !automatic;
-    ckLoadBoost.Visible = automatic;
-    ckWearCap.Visible = automatic;
-    ckSteady.Visible = automatic;
+    manualControls.Visible = currentMode == FanMode.Manual;
+    fanModeSummary.Text = currentMode == FanMode.Manual ? "Holds the set speed" :
+      currentMode == FanMode.Quiet ? "Up to 1,900 RPM normally" : "Up to 2,300 RPM normally";
     tbFan.Value = Math.Max(MIN_UNIT, Math.Min(MAX_UNIT, manualUnit));
     lblFanVal.Text = (manualUnit * FACTOR).ToString("N0") + " RPM";
     lightingGallery.SyncSelection();
     lightingPreview.Invalidate();
     if (tbBri != null && tbBri.Value != bri) tbBri.Value = Math.Max(0, Math.Min(100, bri));
     if (lblBriVal != null) lblBriVal.Text = bri.ToString() + "%";
-    if (ckAutoTurbo != null) ckAutoTurbo.Checked = autoTurbo;
-    if (ckLoadBoost != null) ckLoadBoost.Checked = loadBoost;
-    if (ckWearCap != null) ckWearCap.Checked = (rpmCap > 0);
-    if (ckSteady != null) ckSteady.Checked = (deadband > 0 && downHold > 1);
     if (ckCoolTail != null) ckCoolTail.Checked = coolTail;
     if (ckIdleDim != null) ckIdleDim.Checked = idleDim;
     if (ckNightDim != null) ckNightDim.Checked = nightDim;
     if (ckHyper != null) ckHyper.Checked = hyperBoost;
-    if (tbSmooth != null && tbSmooth.Value != smooth) tbSmooth.Value = Math.Max(0, Math.Min(100, smooth));
-    if (lblSmoothVal != null) lblSmoothVal.Text = smooth + "%";
     if (ckAutoStart != null) ckAutoStart.Checked = IsAutostartEnabled();
     btnPause.Text = paused ? "Resume" : "Pause";
     dashSyncing = false;
@@ -2328,25 +2040,6 @@ static void SyncDash() {
 }
 // per-toggle handlers wired after Check() so each writes exactly one setting
 static void WireToggles() {
-  if (ckAutoTurbo != null) ckAutoTurbo.CheckedChanged += new EventHandler(delegate (object s, EventArgs e) {
-    if (dashSyncing) return;
-    autoTurbo = ckAutoTurbo.Checked; SaveConfig();
-  });
-  if (ckLoadBoost != null) ckLoadBoost.CheckedChanged += new EventHandler(delegate (object s, EventArgs e) {
-    if (dashSyncing) return;
-    loadBoost = ckLoadBoost.Checked; SaveConfig();
-  });
-  if (ckWearCap != null) ckWearCap.CheckedChanged += new EventHandler(delegate (object s, EventArgs e) {
-    if (dashSyncing) return;
-    if (ckWearCap.Checked) { if (rpmCap <= 0) rpmCap = 2300; lastRpmCap = rpmCap; } else { if (rpmCap > 0) lastRpmCap = rpmCap; rpmCap = 0; }
-    SaveConfig();
-  });
-  if (ckSteady != null) ckSteady.CheckedChanged += new EventHandler(delegate (object s, EventArgs e) {
-    if (dashSyncing) return;
-    if (ckSteady.Checked) { if (deadband <= 0) deadband = 2; if (downHold <= 1) downHold = 3; }
-    else { deadband = 0; downHold = 1; }
-    SaveConfig();
-  });
   if (ckCoolTail != null) ckCoolTail.CheckedChanged += new EventHandler(delegate (object s, EventArgs e) {
     if (dashSyncing) return;
     coolTail = ckCoolTail.Checked; SaveConfig();
@@ -2387,15 +2080,7 @@ static void DashTick(object sender, EventArgs e) {
   else if (output.Off && output.Note.Length == 0) lightingStatus.Text = "USB confirmed · lights off";
   else lightingStatus.Text = "USB confirmed · " + output.Brightness + "%" +
       (output.Note.Length == 0 ? "" : " (" + output.Note + ")");
-  int now = Environment.TickCount, deadline = Volatile.Read(ref manualTurboUntil);
-  int seconds = NotExpired(now, deadline) ? (unchecked(deadline - now) + 999) / 1000 : 0;
-  btnTurbo.Enabled = !paused && connected;
-  btnTurbo.Text = seconds > 0 ? "End Burst · " + TimeSpan.FromSeconds(seconds).ToString(@"m\:ss") : "Turbo Burst · 2 min";
-  string reason = fanOverride;
-  overrideStatus.Text = paused ? "Fan control paused" :
-    connected && reason == "Critical temperature" ? reason + " override" :
-    connected && seconds > 0 ? "Turbo Burst override" :
-    connected && reason == "Auto-Turbo" ? reason + " override" : " ";
+  overrideStatus.Text = paused ? "Fan control paused" : connected ? fanOverride : "";
 }
 
 static void DashClosing(object s, FormClosingEventArgs e) {
@@ -2421,7 +2106,7 @@ static void WriteStatus() {
     string lighting = output == null ? "pending" : output.Frame == null ? "retrying" : "confirmed";
     string frame = output == null || output.Frame == null ? "" :
       " ledbri=" + output.Brightness + " ledframe=" + BitConverter.ToString(output.Frame).Replace("-", "");
-    string txt = "ts=" + DateTime.Now.ToString("HH:mm:ss") + " paused=" + paused + " profile=" + prof + " led=" + led + " bri=" + bri +
+    string txt = "ts=" + DateTime.Now.ToString("HH:mm:ss") + " paused=" + paused + " profile=" + fanMode.ToString().ToLowerInvariant() + " led=" + led + " bri=" + bri +
       " cpu=" + curCpu + " gpu=" + curGpu + " unit=" + curUnit + " rpm=" + curRpm +
       " ledsync=" + lighting + frame + " | " + curStatus;
     File.WriteAllText(statusFilePath, txt);
@@ -2448,43 +2133,29 @@ static void Main(string[] args) {
   for (int i = 0; i < args.Length; i++) {
     string a = args[i].ToLowerInvariant();
     if (a == "--interval" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) interval = v; }
-    else if (a == "--maxstep" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) maxStep = v; }
+    else if ((a == "--maxstep" || a == "--rpmcap" || a == "--captemp" || a == "--deadband" ||
+              a == "--downhold" || a == "--coast" || a == "--smooth") &&
+             i + 1 < args.Length && !args[i + 1].StartsWith("--")) i++; // legacy fan options
     else if (a == "--led" && i + 1 < args.Length) led = args[++i].ToLowerInvariant();
     else if (a == "--ledcolor" && i + 1 < args.Length) ledColor = args[++i];
     else if (a == "--ledbri" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) bri = v; }
     else if (a == "--critical" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) critical = v; }
-    else if (a == "--profile" && i + 1 < args.Length) prof = args[++i].ToLowerInvariant();
-    else if (a == "--noautoturbo") autoTurbo = false;
+    else if (a == "--profile" && i + 1 < args.Length) fanMode = ParseFanMode(args[++i]);
     else if (a == "--idledim") idleDim = true;
     else if (a == "--nightdim") nightDim = true;
     else if (a == "--keep") cliKeep = true;
-    else if (a == "--rpmcap" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) rpmCap = v; }
-    else if (a == "--captemp" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) capTemp = v; }
-    else if (a == "--deadband" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) deadband = v; }
-    else if (a == "--downhold" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) downHold = v; }
     else if (a == "--cooltemp" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) coolTemp = v; }
     else if (a == "--nocooltail") coolTail = false;
     else if (a == "--hyperboost") hyperBoost = true;
-    else if (a == "--manual") { manual = true; if (i + 1 < args.Length) { int v; if (int.TryParse(args[i + 1], out v)) { manualUnit = v; i++; } } }
-    else if (a == "--manualunit" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) { manualUnit = v; manual = true; } }
-    else if (a == "--coast" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) coast = v; }
-    else if (a == "--smooth" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) ApplySmooth(v); }
+    else if (a == "--manual") { fanMode = FanMode.Manual; if (i + 1 < args.Length) { int v; if (int.TryParse(args[i + 1], out v)) { manualUnit = v; i++; } } }
+    else if (a == "--manualunit" && i + 1 < args.Length) { int v; if (int.TryParse(args[++i], out v)) { manualUnit = v; fanMode = FanMode.Manual; } }
     else if (a == "--open") openOnStart = true;
     else if (a == "--minimized") openOnStart = false;
-    else if (a == "--nostabilize") { deadband = 0; downHold = 1; }
   }
   if (interval < 500) interval = 500;
   if (bri < 0) bri = 0; if (bri > 100) bri = 100;
-  if (maxStep < 0) maxStep = 0; if (maxStep > 54) maxStep = 54;
-  if (rpmCap < 0) rpmCap = 0; if (rpmCap > MAX_UNIT * FACTOR) rpmCap = MAX_UNIT * FACTOR;
-  if (capTemp < 1) capTemp = 1; if (capTemp > 120) capTemp = 120;
-  if (deadband < 0) deadband = 0; if (deadband > 20) deadband = 20;
-  if (downHold < 1) downHold = 1; if (downHold > 60) downHold = 60;
   if (coolTemp < 20) coolTemp = 20; if (coolTemp > 95) coolTemp = 95;
   if (manualUnit < MIN_UNIT) manualUnit = MIN_UNIT; if (manualUnit > MAX_UNIT) manualUnit = MAX_UNIT;
-  if (coast < 1) coast = 1; if (coast > 120) coast = 120;
-  if (smooth < 0) smooth = 0; if (smooth > 100) smooth = 100;
-  if (rpmCap > 0) lastRpmCap = rpmCap;
   if (cliKeep) keepOnExit = true;
   foreach (string a0 in args) { if (a0.ToLowerInvariant() == "--status") { StatusPrint(); return; } }
   for (int i = 0; i < args.Length; i++) { if (args[i].ToLowerInvariant() == "--status-file" && i + 1 < args.Length) statusFilePath = args[++i]; }
@@ -2520,7 +2191,7 @@ static void Main(string[] args) {
   tray.Visible = true;
   tray.ContextMenuStrip = BuildMenu();
   tray.MouseDoubleClick += new MouseEventHandler(delegate (object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) { try { ShowDashboard(); } catch (Exception dex) { try { LogCrash("dblclick: " + dex.Message); } catch { } } } });
-  CheckGroup(fanItems, prof);
+  CheckGroup(fanItems, fanMode.ToString());
   CheckGroup(briItems, bri.ToString());
   foreach (var it in ledItems) {
     string t = (string)it.Tag;

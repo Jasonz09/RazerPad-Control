@@ -38,12 +38,12 @@ internal static partial class Program {
     lblRpm = GraphiteText("— RPM", 27, Color.FromArgb(220, 201, 255));
     GraphiteAdd(command, lblRpm);
     WorkspaceRule(command);
-    GraphiteAdd(command, GraphiteText("Profile", 10, WorkspaceText));
+    GraphiteAdd(command, GraphiteText("Fan mode", 10, WorkspaceText));
     profBtns.Clear();
-    foreach (string key in new[] { "balanced", "quiet", "performance", "turbo", "manual" }) {
-      string name = key == "balanced" ? "Normal" : char.ToUpperInvariant(key[0]) + key.Substring(1);
+    foreach (FanMode mode in Enum.GetValues(typeof(FanMode))) {
+      string name = mode.ToString();
       var button = GraphiteButton(name);
-      button.Tag = key;
+      button.Tag = name;
       button.Height = 23;
       button.Font = new Font("Segoe UI", 9f);
       button.TextAlign = ContentAlignment.MiddleLeft;
@@ -51,19 +51,12 @@ internal static partial class Program {
       button.AccessibleRole = AccessibleRole.RadioButton;
       button.CornerRadius = 6;
       button.Margin = Padding.Empty;
-      button.Click += delegate {
-        lock (cfgLock) {
-          manual = key == "manual";
-          if (!manual) prof = key;
-        }
-        CheckGroup(fanItems, manual ? "" : prof);
-        SaveConfig();
-        ledDirty = true;
-        SyncDash();
-      };
+      button.Click += delegate { SelectFanMode(mode); };
       GraphiteAdd(command, button);
       profBtns.Add(button);
     }
+    fanModeSummary = GraphiteText("", 9, WorkspaceMuted);
+    GraphiteAdd(command, fanModeSummary);
     GraphiteAdd(instruments, command, 1, 0);
     GraphiteAdd(layout, instruments);
 
@@ -80,55 +73,24 @@ internal static partial class Program {
     lblCpu = AddTemperature(readouts, "CPU", 1);
     lblGpu = AddTemperature(readouts, "GPU", 2);
     GraphiteAdd(footer, readouts, 0, 0);
-    var coolingActions = StudioColumns(43, 57);
-    coolingActions.Margin = new Padding(0, 15, 0, 0);
     btnPause = GraphiteButton("Pause");
+    btnPause.Width = 150;
+    btnPause.Margin = new Padding(0, 15, 0, 0);
     btnPause.CornerRadius = 10;
     btnPause.Image = InstrumentIcon("Pause");
     btnPause.TextImageRelation = TextImageRelation.ImageBeforeText;
-    btnPause.Margin = new Padding(0, 0, 9, 0);
     btnPause.Click += PauseClick;
-    btnTurbo = GraphiteButton("Turbo Burst · 2 min");
-    btnTurbo.CornerRadius = 10;
-    btnTurbo.Image = InstrumentIcon("HyperBoost");
-    btnTurbo.TextImageRelation = TextImageRelation.ImageBeforeText;
-    UsePrimaryButton(btnTurbo);
-    btnTurbo.Click += TurboBurstClick;
-    GraphiteAdd(coolingActions, btnPause, 0, 0);
-    GraphiteAdd(coolingActions, btnTurbo, 1, 0);
-    GraphiteAdd(footer, coolingActions, 1, 0);
+    GraphiteAdd(footer, btnPause, 1, 0);
+    btnPause.Dock = DockStyle.Right;
     GraphiteAdd(layout, footer);
     overrideStatus = GraphiteText("", 9, WorkspaceMuted);
     GraphiteAdd(layout, overrideStatus);
-
-    var tuning = GraphiteGrid(1);
-    var automatic = GraphiteGrid(1);
-    automaticControls = automatic;
-    tbSmooth = AddSlider(automatic, "Fan Steadiness", 0, 100, out lblSmoothVal, SmoothChanged);
-    var sliderEnds = StudioColumns(50, 50);
-    GraphiteAdd(sliderEnds, GraphiteText("More responsive", 8, WorkspaceMuted), 0, 0);
-    var steady = GraphiteText("More steady", 8, WorkspaceMuted);
-    steady.TextAlign = ContentAlignment.MiddleRight;
-    GraphiteAdd(sliderEnds, steady, 1, 0);
-    GraphiteAdd(automatic, sliderEnds);
-    GraphiteAdd(tuning, automatic);
 
     var fixedSpeed = GraphiteGrid(1);
     manualControls = fixedSpeed;
     tbFan = AddSlider(fixedSpeed, "Target speed", MIN_UNIT, MAX_UNIT, out lblFanVal, FanSliderChanged);
     GraphiteAdd(fixedSpeed, GraphiteText("500–3,200 RPM in 50 RPM steps", 8, WorkspaceMuted));
-    GraphiteAdd(tuning, fixedSpeed);
-
-    var maxSpeed = GraphiteGrid(1);
-    turboControls = maxSpeed;
-    GraphiteAdd(maxSpeed, GraphiteText("3,200 RPM fixed speed", 12, GraphiteAccent));
-    GraphiteAdd(tuning, maxSpeed);
-    ckAutoTurbo = AddCheck(tuning, "Auto-Turbo at high temperatures");
-    ckLoadBoost = AddCheck(tuning, "Boost fan ahead of load");
-    ckWearCap = AddCheck(tuning, "Limit fan speed while cool");
-    ckSteady = AddCheck(tuning, "Steady speed control");
-    AddDisclosure(layout, "Fan settings", tuning);
-    tuning.Hide();
+    GraphiteAdd(layout, fixedSpeed);
     return page;
   }
 
