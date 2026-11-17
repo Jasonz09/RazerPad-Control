@@ -15,7 +15,7 @@ internal static partial class Program {
     const int AutomaticCap = 2300 / FACTOR, QuietCap = 1900 / FACTOR;
     const int ReviewMs = 120000, WarmHoldMs = 10000, CoolHoldMs = 60000;
     const int BoostStepMs = 5000, SevereStepMs = 2000, RecoveryStepMs = 10000;
-    const double Warm = 78, Immediate = 82, Severe = 90, Recovered = 69;
+    const double Warm = 72, Immediate = 82, Severe = 90, Recovered = 69;
 
     FanMode? previousMode;
     int normalUnit, command = -1;

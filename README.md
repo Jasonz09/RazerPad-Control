@@ -53,7 +53,7 @@ valid reading and ignores stale GPU samples. The dashboard reports the commanded
 Automatic and Quiet review filtered temperature and its trend every two minutes. Differences below
 150 RPM leave the current command in place. The fan sends speed changes and a 15-second keep-alive.
 
-All three modes use the temperature override. It starts after 10 seconds at 78°C or immediately at
+All three modes use the temperature override. It starts after 10 seconds at 72°C or immediately at
 82°C. It raises the command in 150 RPM steps while the temperature stays level or climbs. At 90°C
 or higher it can step by 250 RPM every two seconds. The command eases back to the regular setting
 after one minute at 69°C or cooler. If the temperature is unavailable, the controller holds its
@@ -83,7 +83,11 @@ Windows 10/11 and the .NET Framework C# compiler are required. Connect the pad o
 |---|---|
 | `Start-RazerPad.cmd` | Launcher |
 | `build.cmd` | Rebuild from source |
-| `src/` | Dashboard and controller source |
+| `src/RazerPadFan.cs` | App entry point, USB communication, settings, and tray |
+| `src/Cooling/` | Fan modes and temperature override |
+| `src/Dashboard/` | Dashboard pages, lighting editor, and shared controls |
+| `src/Lighting/` | Custom effects, rendering, and presets |
+| `assets/` | Cooling pad artwork embedded in the app |
 | `docs/` | USB protocol notes |
 | `bin/` | Local executable, settings, status, and logs |
 

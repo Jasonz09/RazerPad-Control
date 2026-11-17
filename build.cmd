@@ -7,6 +7,16 @@ if not exist "%CSC%" (
   exit /b 1
 )
 if not exist "%~dp0bin\." mkdir "%~dp0bin"
-"%CSC%" /nologo /optimize /target:winexe /out:"%~dp0bin\RazerPadFan.exe" /reference:System.dll /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /resource:"%~dp0assets\cooling-pad.png",CoolingPadArtwork "%~dp0src\RazerPadFan.cs" "%~dp0src\LightingEffects.cs" "%~dp0src\LightingWorkspace.cs" "%~dp0src\StudioDashboard.cs" "%~dp0src\FanController.cs"
+set "SRC=%~dp0src"
+"%CSC%" /nologo /optimize /target:winexe /out:"%~dp0bin\RazerPadFan.exe" ^
+  /reference:System.dll /reference:System.Windows.Forms.dll /reference:System.Drawing.dll ^
+  /resource:"%~dp0assets\cooling-pad.png",CoolingPadArtwork ^
+  "%SRC%\RazerPadFan.cs" ^
+  "%SRC%\Cooling\FanController.cs" ^
+  "%SRC%\Dashboard\Dashboard.cs" ^
+  "%SRC%\Dashboard\DashboardControls.cs" ^
+  "%SRC%\Dashboard\LightingWorkspace.cs" ^
+  "%SRC%\Dashboard\StudioDashboard.cs" ^
+  "%SRC%\Lighting\LightingEffects.cs"
 if errorlevel 1 exit /b 1
 echo Built "%~dp0bin\RazerPadFan.exe"
