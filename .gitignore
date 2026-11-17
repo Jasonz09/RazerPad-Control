@@ -1,0 +1,10 @@
+bin/
+obj/
+*.exe
+*.pdb
+tray.cfg
+autostart.cfg
+status.txt
+crash.log
+*.log
+.vs/
