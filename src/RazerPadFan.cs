@@ -410,7 +410,8 @@ static bool nightDim = false;      // dim the light bar between 22:00 and 07:00
 const int IDLE_BRI = 25;
 const int NIGHT_BRI = 25;
 const int TURBO_MS = 120000;       // duration of a manual "Turbo burst" (2 minutes)
-static volatile int manualTurboUntil = 0;   // Environment.TickCount deadline
+static int manualTurboUntil;      // Environment.TickCount deadline
+static volatile string fanOverride = "";
 static double gpuCache = -1;       // latest GPU temp from the background sampler
 static double gpuLoad = -1;        // latest GPU utilisation % from nvidia-smi
 static double cpuLoad = -1;        // latest CPU utilisation % from PDH
@@ -445,21 +446,19 @@ const double Kd = 1.4;                    // only active while WARMING (damps ov
 const double IBAND_LO = 40, IBAND_HI = 80; // integrate only inside this band (no windup when cold / critical)
 const double IMAX = 14;                   // anti-windup clamp on the integral correction (+/-14 units = +/-700rpm)
 static int coast = 15;                  // anti-hunt: seconds the fan waits before easing DOWN one unit (slow coast-down, prevents pump up/down oscillation)
-// ---------- v8 dashboard (Synapse-style window) ----------
+// ---------- Compact Slate dashboard ----------
 static Form dash;                      // the dashboard window (null = not open)
-static Panel body;                     // dashboard scrollable content panel
 static bool exiting = false;           // set when the user truly exits (so closing the window quits)
 static System.Windows.Forms.Timer dashTimer;   // ~500ms live-refresh for the open window
-static Label lblCpu, lblGpu, lblFan, lblHead, lblMode;   // live read-outs
+static Label lblCpu, lblGpu, lblFan, lblHead;   // live read-outs
 static TrackBar tbFan, tbBri;          // manual fan speed + LED brightness
 static Label lblFanVal, lblBriVal;     // slider value captions
 static ComboBox cbLed;                 // lighting effect selector
-static CheckBox ckAutoTurbo, ckLoadBoost, ckWearCap, ckSteady, ckCoolTail, ckIdleDim, ckNightDim, ckHyper, ckManual; // option toggles
-static Button btnTurbo, btnPause, btnExit;  // action buttons
+static CheckBox ckAutoTurbo, ckLoadBoost, ckWearCap, ckSteady, ckCoolTail, ckIdleDim, ckNightDim, ckHyper; // option toggles
+static Button btnTurbo, btnPause;  // action buttons
 static bool dashSyncing = false;       // guard: suppress slider/toggle events while refreshing the UI
 static List<Button> profBtns = new List<Button>();    // profile quick-select buttons
-static Button activeProfBtn = null;
-static Dictionary<string, Panel> colorSwatches = new Dictionary<string, Panel>();
+static Dictionary<string, Button> colorSwatches = new Dictionary<string, Button>();
 static TrackBar tbSmooth;              // fan steadiness: how hard the controller resists speed changes
 static Label lblSmoothVal;
 static CheckBox ckAutoStart;           // start the controller when Windows starts
@@ -467,8 +466,7 @@ static int smooth = 45;                // 0 = jumps at once ... 100 = very lazy 
 static bool openOnStart = true;      // show the dashboard when launched by hand; the logon autostart passes --minimized
 static bool NotExpired(int now, int until) {
   if (until == 0) return false;
-  int d = until - now;
-  return d > 0 || d < -1800000;    // survive the ~49.7 day tick-count rollover
+  return unchecked(until - now) > 0;  // elapsed arithmetic also works across TickCount rollover
 }
 // device handle shared between the worker and menu actions (only the worker touches it)
 static IntPtr devH = new IntPtr(-1);
@@ -827,13 +825,16 @@ static void WorkerLoop() {
   int loopN = 0, ledPhase = 0, lastLedMs = 0, lastBlinkMs = 0;
   bool critOn = false;
   int lastApplied = -1, failCount = 0, hotStreak = 0, pendingUnit = -1, pendingCnt = 0, holdUnit = -1, decayCnt = 0, loadStreak = 0; int lastSentUnit = -1; int lastSentMs = 0; string profPrev = prof + (manual ? "|manual" : "");
-  bool autoTurboOn = false;
+  bool autoTurboOn = false, burstWasActive = false;
   string appliedSig = "";
   while (_run) {
    try {
     int loopStart = Environment.TickCount;
     if (devH == new IntPtr(-1)) {
-      curStatus = "pad not found (retrying...)"; WriteStatus();
+      curStatus = "pad not found (retrying...)";
+      curUnit = curRpm = -1;
+      fanOverride = "";
+      WriteStatus();
       lastApplied = -1; appliedSig = ""; lastBriApplied = -1; pidI = 0; emaT = -1; lastMeas = -1; lastDeriv = 0; lastSentUnit = -1; lastSentMs = 0;
       if (!Reopen()) { for (int s = 0; s < 30 && _run; s++) Thread.Sleep(100); continue; }
     }
@@ -870,14 +871,20 @@ static void WorkerLoop() {
     int relT = trigT - 10; if (relT < 40) relT = 40;
     if (use >= trigT) { hotStreak++; if (hotStreak >= 4) autoTurboOn = true; }
     else if (use >= 0 && use <= relT) { hotStreak = 0; autoTurboOn = false; }
-    bool manualTurbo = NotExpired(now, manualTurboUntil);
+    int burstDeadline = Volatile.Read(ref manualTurboUntil);
+    bool manualTurbo = NotExpired(now, burstDeadline);
+    if (burstDeadline != 0 && !manualTurbo)
+      Interlocked.CompareExchange(ref manualTurboUntil, 0, burstDeadline);
+    bool burstEnded = burstWasActive && !manualTurbo;
+    burstWasActive = manualTurbo;
 
     int fixedU, rmin, rmax;
     List<CP> pts = ProfileCurve(mp, out fixedU, out rmin, out rmax);
-    if (man && fixedU < 0) { fixedU = mu; }   // manual mode: hold a fixed speed unless critical/turbo overrides
+    if (man) fixedU = mu;
     int unit; bool forceMax = false;
-    if (crit) { unit = MAX_UNIT; forceMax = true; }
-    else if (at && (autoTurboOn || manualTurbo)) { unit = MAX_UNIT; forceMax = true; }
+    string overrideReason = crit ? "Critical temperature" : manualTurbo ? "Turbo Burst" :
+                            at && autoTurboOn ? "Auto-Turbo" : "";
+    if (overrideReason.Length != 0) { unit = MAX_UNIT; forceMax = true; }
     else if (fixedU >= 0) unit = fixedU;
     else if (use < 0) unit = lastApplied < 0 ? 30 : lastApplied;
     else {
@@ -947,7 +954,7 @@ static void WorkerLoop() {
     // but only ease DOWN slowly (1 unit per coast seconds), and freeze entirely inside the deadband.
     int delta = unit - lastApplied;
     int decayLoops = coast * 1000 / (mi < 500 ? 500 : mi); if (decayLoops < 1) decayLoops = 1;
-    if (forceMax || lastApplied < 0 || (man && fixedU >= 0)) {
+    if (forceMax || burstEnded || lastApplied < 0 || fixedU >= 0) {
       lastApplied = unit; holdUnit = unit; decayCnt = 0;
     } else if (ms <= 0) {
       lastApplied = unit; holdUnit = unit; decayCnt = 0;
@@ -989,6 +996,7 @@ static void WorkerLoop() {
 
     // ---------- lighting is driven by the dedicated LedLoop thread (smooth ~25fps) ----------
 
+    fanOverride = overrideReason;
     bool turboShow = forceMax && !crit;
     curStatus = "CPU " + (cpuT < 0 ? "n/a" : cpuT.ToString("0") + "C") +
                 "  GPU " + (gpuT < 0 ? "n/a" : gpuT.ToString("0") + "C") +
@@ -1040,10 +1048,11 @@ static void CheckGroup(List<ToolStripMenuItem> g, string tag) {
 }
 static void FanClick(object s, EventArgs e) {
   ToolStripMenuItem mi = (ToolStripMenuItem)s;
-  lock (cfgLock) { prof = (string)mi.Tag; }
+  lock (cfgLock) { prof = (string)mi.Tag; manual = false; }
   CheckGroup(fanItems, (string)mi.Tag);
   ledDirty = true;
   SaveConfig();
+  SyncDash();
 }
 static void LedClick(object s, EventArgs e) {
   ToolStripMenuItem mi = (ToolStripMenuItem)s;
@@ -1071,12 +1080,22 @@ static void BriClick(object s, EventArgs e) {
 }
 static void PauseClick(object s, EventArgs e) {
   paused = !paused;
-  ((ToolStripMenuItem)s).Checked = paused;
-  ((ToolStripMenuItem)s).Text = paused ? "Resume automation" : "Pause automation";
+  if (paused) Volatile.Write(ref manualTurboUntil, 0);
+  if (pauseItem != null) {
+    pauseItem.Checked = paused;
+    pauseItem.Text = paused ? "Resume automation" : "Pause automation";
+  }
+  SyncDash();
+  DashTick(null, EventArgs.Empty);
   ledDirty = true;
 }
 static void TurboBurstClick(object s, EventArgs e) {
-  manualTurboUntil = Environment.TickCount + TURBO_MS;
+  if (paused) return;
+  int now = Environment.TickCount;
+  int deadline = unchecked(now + TURBO_MS);
+  int currentDeadline = Volatile.Read(ref manualTurboUntil);
+  Volatile.Write(ref manualTurboUntil, NotExpired(now, currentDeadline) ? 0 : (deadline == 0 ? 1 : deadline));
+  DashTick(null, EventArgs.Empty);
 }
 static void AutoTurboClick(object s, EventArgs e) {
   ToolStripMenuItem mi = (ToolStripMenuItem)s;
@@ -1255,6 +1274,7 @@ static ContextMenuStrip BuildMenu() {
   m.Items.Add(asu);
   ToolStripMenuItem pause = new ToolStripMenuItem("Pause automation");
   pause.Click += new EventHandler(PauseClick);
+  pauseItem = pause;
   m.Items.Add(pause);
   m.Items.Add(new ToolStripSeparator());
   ToolStripMenuItem exit = new ToolStripMenuItem("Exit");
@@ -1291,164 +1311,330 @@ static void UiTick(object s, EventArgs e) {
 // ===================== v8 dashboard: a Synapse-style control window =====================
 // Shares the exact engine/threads/globals of the tray (tray stays the source of truth).
 // Every control writes the same globals + SaveConfig(), so window and tray menu stay in sync.
+static readonly Color SlateBackground = Color.FromArgb(16, 25, 38);
+static readonly Color SlatePanel = Color.FromArgb(24, 37, 54);
+static readonly Color SlateBorder = Color.FromArgb(61, 81, 105);
+static readonly Color SlateAccent = Color.FromArgb(110, 221, 245);
+static Panel automaticControls, manualControls, turboControls, automationOptions, lightingOptions, deviceOptions, speedMeter;
+static Label overrideStatus;
+static ToolStripMenuItem pauseItem;
+
 static void ShowDashboard() {
-  if (dash != null && !dash.IsDisposed) { try { if (dash.WindowState == FormWindowState.Minimized) dash.WindowState = FormWindowState.Normal; dash.Activate(); dash.BringToFront(); } catch { } return; }
-  try {
-    Form f = new Form();
-    f.Text = "RazerPad Control";
-    f.ClientSize = new Size(660, 826);
-    f.StartPosition = FormStartPosition.CenterScreen;
-    f.BackColor = Color.FromArgb(20, 22, 26);
-    f.ForeColor = Color.FromArgb(225, 228, 232);
-    f.Font = new Font("Segoe UI", 9f);
-    f.FormBorderStyle = FormBorderStyle.FixedSingle;
-    f.MaximizeBox = false;
-    f.ShowInTaskbar = true;
-    try { f.Icon = MakeIcon(Math.Max(0, Math.Max(curCpu, curGpu))); } catch { }
-
-    // ---- header banner ----
-    Panel head = new Panel();
-    head.Dock = DockStyle.Top; head.Height = 74;
-    head.Paint += new PaintEventHandler(delegate (object ps, PaintEventArgs pe) {
-      using (System.Drawing.Drawing2D.LinearGradientBrush gb = new System.Drawing.Drawing2D.LinearGradientBrush(new Rectangle(0, 0, head.Width, head.Height), Color.FromArgb(20, 120, 70), Color.FromArgb(22, 25, 32), System.Drawing.Drawing2D.LinearGradientMode.Horizontal))
-        pe.Graphics.FillRectangle(gb, 0, 0, head.Width, head.Height);
-    });
-    Label h1 = new Label();
-    h1.Text = "RAZER COOLING PAD";
-    h1.AutoSize = true; h1.Font = new Font("Segoe UI", 15f, FontStyle.Bold);
-    h1.ForeColor = Color.FromArgb(90, 220, 130); h1.BackColor = Color.Transparent;
-    h1.Location = new Point(16, 10); head.Controls.Add(h1);
-    lblHead = new Label();
-    lblHead.AutoSize = true; lblHead.ForeColor = Color.FromArgb(210, 215, 220); lblHead.BackColor = Color.Transparent;
-    lblHead.Location = new Point(18, 44); lblHead.Text = "connecting...";
-    head.Controls.Add(lblHead);
-
-    // ---- body panel (holds all controls, scrollable) ----
-    body = new Panel();
-    body.Dock = DockStyle.Fill; body.BackColor = Color.FromArgb(20, 22, 26); body.AutoScroll = true;
-
-    // ---- stat cards ----
-    Panel cardCpu = StatCard("CPU", 16, 84); lblCpu = (Label)cardCpu.Controls["v"];
-    Panel cardGpu = StatCard("GPU", 176, 84); lblGpu = (Label)cardGpu.Controls["v"];
-    Panel cardFan = StatCard("FAN", 336, 84); lblFan = (Label)cardFan.Controls["v"];
-    Panel cardMode = StatCard("MODE", 496, 84); lblMode = (Label)cardMode.Controls["v"];
-
-    // ---- fan profile buttons ----
-    body.Controls.Add(SectionLabel("FAN PROFILE", 16, 190));
-    string[] pn = { "Quiet", "Balanced", "Performance", "Turbo" };
-    string[] pt = { "quiet", "balanced", "performance", "turbo" };
-    int bx = 16;
-    for (int i = 0; i < pn.Length; i++) {
-      Button b = Pill(pn[i], bx, 214);
-      string tag = pt[i];
-      b.Click += new EventHandler(delegate (object s, EventArgs e) {
-        lock (cfgLock) { prof = tag; manual = false; }
-        CheckGroup(fanItems, tag); SaveConfig(); ledDirty = true; SyncDash();
-      });
-      profBtns.Add(b); body.Controls.Add(b); bx += b.Width + 8;
-    }
-    Button bMan = Pill("Manual", bx, 214);
-    bMan.Click += new EventHandler(delegate (object s, EventArgs e) {
-      lock (cfgLock) { manual = !manual; }
-      SaveConfig(); ledDirty = true; SyncDash();
-    });
-    body.Controls.Add(bMan);
-
-    // ---- manual fan slider ----
-    body.Controls.Add(SectionLabel("MANUAL FAN SPEED", 16, 256));
-    tbFan = new TrackBar();
-    tbFan.Minimum = MIN_UNIT; tbFan.Maximum = MAX_UNIT; tbFan.SmallChange = 1; tbFan.LargeChange = 2;
-    tbFan.TickFrequency = 6; tbFan.AutoSize = false;
-    tbFan.SetBounds(12, 280, 520, 36);
-    tbFan.BackColor = Color.FromArgb(20, 22, 26);
-    tbFan.Enabled = false;
-    tbFan.Scroll += new EventHandler(FanSliderChanged);
-    tbFan.ValueChanged += new EventHandler(FanSliderChanged);
-    body.Controls.Add(tbFan);
-    lblFanVal = SectionLabel("", 540, 288); body.Controls.Add(lblFanVal);
-
-    // ---- lighting effect + color ----
-    body.Controls.Add(SectionLabel("LIGHTING EFFECT", 16, 330));
-    cbLed = new ComboBox();
-    cbLed.DropDownStyle = ComboBoxStyle.DropDownList;
-    cbLed.SetBounds(16, 354, 210, 28);
-    cbLed.BackColor = Color.FromArgb(34, 38, 46); cbLed.ForeColor = Color.White;
-    cbLed.FlatStyle = FlatStyle.Flat;
-    cbLed.Items.AddRange(new object[] { "heatmap", "level", "wave", "spectrum", "loadmeter", "breath", "rainbow", "static", "off" });
-    cbLed.SelectedIndexChanged += new EventHandler(LedComboChanged);
-    body.Controls.Add(cbLed);
-    int cx = 236;
-    string[] cn = { "green", "cyan", "blue", "purple", "red", "orange", "pink", "white" };
-    for (int i = 0; i < cn.Length; i++) {
-      Panel sw = new Panel();
-      sw.Size = new Size(26, 26); sw.Location = new Point(cx, 355);
-      sw.BackColor = ParseHex(ColorName(cn[i])); sw.BorderStyle = BorderStyle.FixedSingle; sw.Cursor = Cursors.Hand;
-      string ctag = cn[i];
-      sw.Click += new EventHandler(delegate (object s, EventArgs e) {
-        lock (cfgLock) { led = "static"; ledColor = ctag; }
-        string tag = "static:" + ctag;
-        foreach (var it in ledItems) { it.Checked = string.Equals((string)it.Tag, tag, StringComparison.OrdinalIgnoreCase); }
-        SaveConfig(); ledDirty = true; SyncDash();
-      });
-      colorSwatches.Add(ctag, sw); body.Controls.Add(sw); cx += 30;
-    }
-
-    // ---- brightness slider ----
-    body.Controls.Add(SectionLabel("LED BRIGHTNESS", 16, 396));
-    tbBri = new TrackBar();
-    tbBri.Minimum = 0; tbBri.Maximum = 100; tbBri.SmallChange = 5; tbBri.LargeChange = 10;
-    tbBri.TickFrequency = 10; tbBri.AutoSize = false;
-    tbBri.SetBounds(12, 420, 520, 36);
-    tbBri.BackColor = Color.FromArgb(20, 22, 26);
-    tbBri.Scroll += new EventHandler(BriSliderChanged);
-    tbBri.ValueChanged += new EventHandler(BriSliderChanged);
-    body.Controls.Add(tbBri);
-    lblBriVal = SectionLabel("", 540, 428); body.Controls.Add(lblBriVal);
-
-    // ---- fan steadiness: ONE friendly slider for the anti-hunt behaviour ----
-    body.Controls.Add(SectionLabel("FAN STEADINESS  (higher = calmer, lower = faster to react)", 16, 466));
-    tbSmooth = new TrackBar();
-    tbSmooth.Minimum = 0; tbSmooth.Maximum = 100; tbSmooth.SmallChange = 5; tbSmooth.LargeChange = 10;
-    tbSmooth.TickFrequency = 10; tbSmooth.AutoSize = false;
-    tbSmooth.SetBounds(12, 490, 520, 36);
-    tbSmooth.BackColor = Color.FromArgb(20, 22, 26);
-    tbSmooth.Scroll += new EventHandler(SmoothChanged);
-    tbSmooth.ValueChanged += new EventHandler(SmoothChanged);
-    body.Controls.Add(tbSmooth);
-    lblSmoothVal = SectionLabel("", 540, 498); body.Controls.Add(lblSmoothVal);
-
-    // ---- option toggles (two columns) ----
-    body.Controls.Add(SectionLabel("AUTOMATION & OPTIONS", 16, 536));
-    ckManual = Check("Manual fan (hold slider value)", 16, 560);
-    ckAutoTurbo = Check("Auto-turbo when very hot", 16, 586);
-    ckLoadBoost = Check("Boost fan ahead of load", 16, 612);
-    ckWearCap = Check("Protect fan: cap 2300 until hot", 16, 638);
-    ckSteady = Check("Steady speed (anti-flap)", 336, 560);
-    ckCoolTail = Check("Wind down gently on exit", 336, 586);
-    ckIdleDim = Check("Dim LEDs when idle/cool", 336, 612);
-    ckNightDim = Check("Dim LEDs at night (22-07)", 336, 638);
-    ckHyper = Check("HyperBoost (max power)", 336, 664);
-    ckAutoStart = Check("Start with Windows", 16, 664);
-
-    // ---- action buttons (bottom row) ----
-    btnTurbo = Action("TURBO BURST 2 min", 16, 706); btnTurbo.BackColor = Color.FromArgb(30, 95, 55);
-    btnTurbo.Click += new EventHandler(delegate (object s, EventArgs e) { manualTurboUntil = Environment.TickCount + TURBO_MS; });
-    btnPause = Action("Pause", 220, 706);
-    btnPause.Click += new EventHandler(delegate (object s, EventArgs e) { paused = !paused; ledDirty = true; SyncDash(); });
-    btnExit = Action("Exit app", 340, 706); btnExit.BackColor = Color.FromArgb(120, 40, 40);
-    btnExit.Click += new EventHandler(ExitClick);
-
-    body.Controls.Add(btnTurbo); body.Controls.Add(btnPause); body.Controls.Add(btnExit);
-    f.Controls.Add(head); f.Controls.Add(body); head.BringToFront();
-    f.FormClosing += new FormClosingEventHandler(DashClosing);
-
-    dash = f;
-    WireToggles();
-    LoadDashState(); SyncDash();
-    f.Show();
-    if (dashTimer == null) { dashTimer = new System.Windows.Forms.Timer(); dashTimer.Interval = 500; dashTimer.Tick += new EventHandler(DashTick); }
+  if (dash != null && !dash.IsDisposed) {
+    SyncDash();
+    DashTick(null, EventArgs.Empty);
+    dash.Show();
+    if (dash.WindowState == FormWindowState.Minimized) dash.WindowState = FormWindowState.Normal;
+    dash.Activate();
     dashTimer.Start();
-  } catch (Exception ex) { try { LogCrash("ShowDashboard: " + ex.Message + " | " + ex.StackTrace); } catch { } }
+    return;
+  }
+
+  Form window = new Form();
+  window.Text = "RazerPad Control";
+  Rectangle screen = Screen.FromPoint(Cursor.Position).WorkingArea;
+  window.ClientSize = new Size(Math.Min(788, Math.Max(380, screen.Width - 48)),
+                               Math.Min(520, Math.Max(320, screen.Height - 84)));
+  window.StartPosition = FormStartPosition.CenterScreen;
+  window.BackColor = SlateBackground;
+  window.ForeColor = Color.FromArgb(232, 240, 250);
+  window.Font = new Font("Segoe UI", 10f);
+  window.MinimumSize = new Size(420, 380);
+  window.AutoScaleMode = AutoScaleMode.Dpi;
+  window.FormClosing += DashClosing;
+  try { window.Icon = MakeIcon(Math.Max(0, Math.Max(curCpu, curGpu))); } catch { }
+
+  Panel scroll = new Panel { AutoScroll = true, Dock = DockStyle.Fill, Padding = new Padding(16) };
+  TableLayoutPanel layout = SlateGrid(1);
+  layout.Dock = DockStyle.Top;
+  scroll.Controls.Add(layout);
+  window.Controls.Add(scroll);
+
+  TableLayoutPanel telemetry = SlateGrid(3);
+  telemetry.ColumnStyles.Clear();
+  telemetry.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
+  telemetry.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 21));
+  telemetry.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 21));
+  telemetry.Padding = new Padding(10, 4, 10, 8);
+  telemetry.BackColor = SlatePanel;
+  SlateAdd(layout, telemetry);
+  TableLayoutPanel speed = SlateGrid(1);
+  speed.Margin = new Padding(0, 0, 12, 0);
+  lblFan = SlateText("-- RPM", 30, SlateAccent);
+  lblFan.AccessibleName = "Commanded fan speed";
+  speedMeter = new Panel { Height = 7, Margin = new Padding(2, 2, 0, 7), AccessibleName = "Fan speed indicator" };
+  speedMeter.Paint += delegate (object sender, PaintEventArgs e) {
+    const int segments = 18;
+    float width = (float)speedMeter.ClientSize.Width / segments;
+    int active = (Math.Max(0, curRpm) * segments + MAX_UNIT * FACTOR / 2) / (MAX_UNIT * FACTOR);
+    using (Brush fill = new SolidBrush(SlateAccent))
+    using (Brush track = new SolidBrush(SlateBorder)) {
+      for (int i = 0; i < segments; i++)
+        e.Graphics.FillRectangle(i < active ? fill : track, i * width, 0, Math.Max(0, width - 3), speedMeter.Height);
+    }
+  };
+  lblHead = SlateText("Connecting to cooling pad", 9, Color.LightSteelBlue);
+  SlateAdd(speed, lblFan);
+  SlateAdd(speed, speedMeter);
+  SlateAdd(speed, lblHead);
+  SlateAdd(telemetry, speed, 0, 0);
+  lblCpu = AddTemperature(telemetry, "CPU", 1);
+  lblGpu = AddTemperature(telemetry, "GPU", 2);
+
+  TableLayoutPanel profiles = SlateGrid(1);
+  profiles.Margin = new Padding(0, 4, 0, 0);
+  SlateAdd(profiles, SlateText("Fan profile", 10, Color.LightSteelBlue));
+  TableLayoutPanel choices = SlateGrid(5);
+  profBtns.Clear();
+  foreach (string name in new[] { "Quiet", "Balanced", "Performance", "Turbo", "Manual" }) {
+    Button button = SlateButton(name);
+    button.Margin = new Padding(0, 0, 5, 0);
+    button.Click += delegate {
+      lock (cfgLock) {
+        manual = name == "Manual";
+        if (!manual) prof = name.ToLowerInvariant();
+      }
+      CheckGroup(fanItems, manual ? "" : prof);
+      SaveConfig();
+      ledDirty = true;
+      SyncDash();
+    };
+    SlateAdd(choices, button, profBtns.Count, 0);
+    profBtns.Add(button);
+  }
+  SlateAdd(profiles, choices);
+  SlateAdd(layout, profiles);
+
+  TableLayoutPanel cards = SlateGrid(2);
+  TableLayoutPanel cooling = SlateCard("Cooling");
+  cooling.Margin = new Padding(0, 0, 6, 0);
+  TableLayoutPanel automatic = SlateGrid(1);
+  automaticControls = automatic;
+  tbSmooth = AddSlider(automatic, "Fan steadiness", 0, 100, out lblSmoothVal, SmoothChanged);
+  TableLayoutPanel sliderEnds = SlateGrid(2);
+  SlateAdd(sliderEnds, SlateText("More responsive", 8, Color.LightSteelBlue), 0, 0);
+  Label steadyEnd = SlateText("More steady", 8, Color.LightSteelBlue);
+  steadyEnd.TextAlign = ContentAlignment.MiddleRight;
+  SlateAdd(sliderEnds, steadyEnd, 1, 0);
+  SlateAdd(automatic, sliderEnds);
+  SlateAdd(cooling, automatic);
+
+  TableLayoutPanel fixedSpeed = SlateGrid(1);
+  manualControls = fixedSpeed;
+  tbFan = AddSlider(fixedSpeed, "Target speed", MIN_UNIT, MAX_UNIT, out lblFanVal, FanSliderChanged);
+  SlateAdd(fixedSpeed, SlateText("500–3,200 RPM in 50 RPM steps", 8, Color.LightSteelBlue));
+  SlateAdd(cooling, fixedSpeed);
+
+  TableLayoutPanel maxSpeed = SlateGrid(1);
+  turboControls = maxSpeed;
+  SlateAdd(maxSpeed, SlateText("3,200 RPM fixed speed", 12, SlateAccent));
+  SlateAdd(cooling, maxSpeed);
+  TableLayoutPanel automation = SlateGrid(1);
+  automationOptions = automation;
+  ckAutoTurbo = AddCheck(automation, "Auto-Turbo at high temperatures");
+  ckLoadBoost = AddCheck(automation, "Boost fan ahead of load");
+  ckWearCap = AddCheck(automation, "Limit fan speed while cool");
+  ckSteady = AddCheck(automation, "Steady speed control");
+  AddDisclosure(cooling, "Fan automation", automation);
+  SlateAdd(cards, cooling, 0, 0);
+  cooling.Dock = DockStyle.Fill;
+
+  TableLayoutPanel lighting = SlateCard("Lighting");
+  lighting.Margin = new Padding(6, 0, 0, 0);
+  cbLed = new ComboBox {
+    DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
+    DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 23, FormattingEnabled = true,
+    BackColor = SlateBackground, ForeColor = window.ForeColor, AccessibleName = "Lighting effect"
+  };
+  cbLed.Items.AddRange(new object[] { "heatmap", "level", "wave", "spectrum", "loadmeter", "breath", "rainbow", "static", "off" });
+  cbLed.Format += delegate (object sender, ListControlConvertEventArgs e) {
+    string effect = (string)e.ListItem;
+    e.Value = effect == "loadmeter" ? "Load meter" :
+              effect.Length > 0 ? char.ToUpperInvariant(effect[0]) + effect.Substring(1) : effect;
+  };
+  cbLed.DrawItem += delegate (object sender, DrawItemEventArgs e) {
+    bool selected = (e.State & DrawItemState.Selected) != 0;
+    using (Brush background = new SolidBrush(selected ? Color.FromArgb(29, 73, 103) : SlateBackground))
+      e.Graphics.FillRectangle(background, e.Bounds);
+    if (e.Index >= 0) {
+      Rectangle textBounds = Rectangle.Inflate(e.Bounds, -6, 0);
+      TextRenderer.DrawText(e.Graphics, cbLed.GetItemText(cbLed.Items[e.Index]), cbLed.Font,
+                            textBounds, cbLed.ForeColor, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+    }
+    e.DrawFocusRectangle();
+  };
+  cbLed.SelectedIndexChanged += LedComboChanged;
+  SlateAdd(lighting, cbLed);
+  TableLayoutPanel swatches = SlateGrid(8);
+  colorSwatches.Clear();
+  foreach (string name in new[] { "cyan", "blue", "purple", "pink", "red", "orange", "green", "white" }) {
+    Button swatch = SlateButton("");
+    swatch.Height = 24;
+    swatch.Margin = new Padding(0, 2, 5, 2);
+    swatch.AccessibleName = name + " static lighting";
+    swatch.BackColor = ParseHex(ColorName(name));
+    swatch.Click += delegate {
+      lock (cfgLock) { led = "static"; ledColor = name; }
+      CheckGroup(ledItems, "static:" + name);
+      SaveConfig();
+      ledDirty = true;
+      SyncDash();
+    };
+    SlateAdd(swatches, swatch, colorSwatches.Count, 0);
+    colorSwatches.Add(name, swatch);
+  }
+  SlateAdd(lighting, swatches);
+  TableLayoutPanel lightSettings = SlateGrid(1);
+  lightingOptions = lightSettings;
+  tbBri = AddSlider(lightSettings, "Brightness", 0, 100, out lblBriVal, BriSliderChanged);
+  ckIdleDim = AddCheck(lightSettings, "Dim when idle or cool");
+  ckNightDim = AddCheck(lightSettings, "Dim at night (22:00–07:00)");
+  AddDisclosure(lighting, "Lighting options", lightSettings);
+  SlateAdd(cards, lighting, 1, 0);
+  lighting.Dock = DockStyle.Fill;
+  SlateAdd(layout, cards);
+
+  TableLayoutPanel bottom = SlateGrid(2);
+  TableLayoutPanel device = SlateCard("Device");
+  device.Margin = new Padding(0, 0, 6, 0);
+  ckHyper = AddCheck(device, "HyperBoost (plugged in)");
+  TableLayoutPanel deviceSettings = SlateGrid(1);
+  deviceOptions = deviceSettings;
+  ckAutoStart = AddCheck(deviceSettings, "Start with Windows");
+  ckCoolTail = AddCheck(deviceSettings, "Wind fan down on exit");
+  Button exit = SlateButton("Exit app");
+  exit.Click += ExitClick;
+  SlateAdd(deviceSettings, exit);
+  AddDisclosure(device, "Device options", deviceSettings);
+  SlateAdd(bottom, device, 0, 0);
+
+  TableLayoutPanel actions = SlateGrid(1);
+  actions.Margin = new Padding(6, 0, 0, 0);
+  overrideStatus = SlateText("", 9, Color.LightSteelBlue);
+  SlateAdd(actions, overrideStatus);
+  TableLayoutPanel buttons = SlateGrid(2);
+  buttons.ColumnStyles.Clear();
+  buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
+  buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 68));
+  btnPause = SlateButton("Pause");
+  btnPause.Margin = new Padding(0, 0, 5, 0);
+  btnPause.Click += PauseClick;
+  btnTurbo = SlateButton("Turbo Burst · 2 min");
+  btnTurbo.BackColor = SlateAccent;
+  btnTurbo.ForeColor = SlateBackground;
+  btnTurbo.FlatAppearance.MouseOverBackColor = Color.FromArgb(155, 233, 249);
+  btnTurbo.Click += TurboBurstClick;
+  SlateAdd(buttons, btnPause, 0, 0);
+  SlateAdd(buttons, btnTurbo, 1, 0);
+  SlateAdd(actions, buttons);
+  SlateAdd(bottom, actions, 1, 0);
+  SlateAdd(layout, bottom);
+
+  dash = window;
+  WireToggles();
+  automationOptions.Hide();
+  lightingOptions.Hide();
+  deviceOptions.Hide();
+  window.Shown += delegate {
+    SyncDash();
+    DashTick(null, EventArgs.Empty);
+  };
+  dashTimer = new System.Windows.Forms.Timer { Interval = 500 };
+  dashTimer.Tick += DashTick;
+  window.Show();
+  dashTimer.Start();
+}
+
+static TableLayoutPanel SlateGrid(int columns) {
+  TableLayoutPanel panel = new TableLayoutPanel {
+    AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = columns,
+    Margin = Padding.Empty, GrowStyle = TableLayoutPanelGrowStyle.AddRows
+  };
+  for (int i = 0; i < columns; i++)
+    panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f / columns));
+  return panel;
+}
+
+static void SlateAdd(TableLayoutPanel grid, Control control, int column = 0, int row = -1) {
+  if (row < 0) {
+    row = grid.RowCount++;
+    grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+    control.Margin = new Padding(control.Margin.Left, 0, control.Margin.Right, 6);
+  }
+  control.Dock = DockStyle.Top;
+  grid.Controls.Add(control, column, row);
+}
+
+static TableLayoutPanel SlateCard(string title) {
+  TableLayoutPanel card = SlateGrid(1);
+  card.BackColor = SlatePanel;
+  card.Padding = new Padding(11, 8, 11, 3);
+  SlateAdd(card, SlateText(title, 13, Color.White));
+  return card;
+}
+
+static Label SlateText(string text, float size, Color color) {
+  return new Label {
+    AutoSize = true, Margin = Padding.Empty, Text = text,
+    Font = new Font("Segoe UI Semibold", size), ForeColor = color
+  };
+}
+
+static Label AddTemperature(TableLayoutPanel parent, string name, int column) {
+  TableLayoutPanel group = SlateGrid(1);
+  SlateAdd(group, SlateText(name, 9, Color.LightSteelBlue));
+  Label value = SlateText("--", 21, Color.White);
+  value.AccessibleName = name + " temperature";
+  SlateAdd(group, value);
+  SlateAdd(parent, group, column, 0);
+  return value;
+}
+
+static Button SlateButton(string text) {
+  Button button = new Button {
+    Height = 34, Margin = Padding.Empty, Text = text, FlatStyle = FlatStyle.Flat,
+    BackColor = SlatePanel, ForeColor = Color.White, Cursor = Cursors.Hand,
+    UseVisualStyleBackColor = false
+  };
+  button.FlatAppearance.BorderColor = SlateBorder;
+  return button;
+}
+
+static TrackBar AddSlider(TableLayoutPanel grid, string name, int min, int max, out Label value, EventHandler changed) {
+  TableLayoutPanel heading = SlateGrid(2);
+  heading.ColumnStyles.Clear();
+  heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 57));
+  heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 43));
+  SlateAdd(heading, SlateText(name, 10, Color.White), 0, 0);
+  value = SlateText("", 10, SlateAccent);
+  value.TextAlign = ContentAlignment.MiddleRight;
+  SlateAdd(heading, value, 1, 0);
+  SlateAdd(grid, heading);
+  TrackBar slider = new TrackBar {
+    Minimum = min, Maximum = max, Value = min, SmallChange = 1, LargeChange = 5,
+    TickStyle = TickStyle.None, AutoSize = false, Height = 25,
+    Margin = Padding.Empty, BackColor = SlatePanel, AccessibleName = name
+  };
+  slider.ValueChanged += changed;
+  SlateAdd(grid, slider);
+  return slider;
+}
+
+static CheckBox AddCheck(TableLayoutPanel grid, string text) {
+  CheckBox check = new CheckBox { Text = text, AutoSize = true, Margin = Padding.Empty };
+  SlateAdd(grid, check);
+  return check;
+}
+
+static void AddDisclosure(TableLayoutPanel parent, string title, Panel options) {
+  Button button = SlateButton("+  " + title);
+  button.TextAlign = ContentAlignment.MiddleLeft;
+  button.Click += delegate {
+    options.Visible = !options.Visible;
+    button.Text = (options.Visible ? "−  " : "+  ") + title;
+  };
+  SlateAdd(parent, button);
+  SlateAdd(parent, options);
 }
 static Color ParseHex(string hex) {
   try {
@@ -1459,43 +1645,12 @@ static Color ParseHex(string hex) {
   } catch { }
   return Color.Lime;
 }
-static Panel StatCard(string title, int x, int y) {
-  Panel card = new Panel(); card.BackColor = Color.FromArgb(30, 33, 40); card.SetBounds(x, y, 140, 92);
-  Label t = new Label(); t.Text = title; t.AutoSize = true; t.ForeColor = Color.FromArgb(120, 200, 150);
-  t.Font = new Font("Segoe UI", 9f, FontStyle.Bold); t.Location = new Point(12, 10);
-  Label v = new Label(); v.Name = "v"; v.AutoSize = true; v.ForeColor = Color.White;
-  v.Font = new Font("Segoe UI", 19f, FontStyle.Bold); v.Location = new Point(12, 40); v.Text = "--";
-  card.Controls.Add(t); card.Controls.Add(v); body.Controls.Add(card); return card;
-}
-static Button Pill(string txt, int x, int y) {
-  Button b = new Button(); b.Text = txt; b.AutoSize = true; b.FlatStyle = FlatStyle.Flat;
-  b.BackColor = Color.FromArgb(38, 42, 50); b.ForeColor = Color.White;
-  b.FlatAppearance.BorderColor = Color.FromArgb(70, 76, 86); b.Padding = new Padding(10, 5, 10, 5);
-  b.Location = new Point(x, y); b.Cursor = Cursors.Hand; return b;
-}
-static Button Action(string txt, int x, int y) {
-  Button b = new Button(); b.Text = txt; b.AutoSize = true; b.FlatStyle = FlatStyle.Flat;
-  b.BackColor = Color.FromArgb(38, 42, 50); b.ForeColor = Color.White;
-  b.FlatAppearance.BorderColor = Color.FromArgb(90, 96, 106); b.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-  b.Padding = new Padding(12, 8, 12, 8); b.Location = new Point(x, y); b.Cursor = Cursors.Hand; return b;
-}
-static CheckBox Check(string txt, int x, int y) {
-  CheckBox c = new CheckBox(); c.Text = txt; c.AutoSize = true; c.ForeColor = Color.FromArgb(210, 214, 220);
-  c.Location = new Point(x, y); return c;
-}
-static Label SectionLabel(string txt, int x, int y) {
-  Label l = new Label(); l.Text = txt; l.AutoSize = true; l.ForeColor = Color.FromArgb(150, 200, 170);
-  l.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold); l.Location = new Point(x, y); return l;
-}
-
 static void FanSliderChanged(object s, EventArgs e) {
   if (dashSyncing) return;
   int v = tbFan.Value;
   lock (cfgLock) { manualUnit = v; manual = true; }
   SaveConfig();
-  if (lblFanVal != null) lblFanVal.Text = (v * FACTOR).ToString() + " rpm";
-  if (ckManual != null && !ckManual.Checked) { dashSyncing = true; ckManual.Checked = true; dashSyncing = false; }
-  CheckGroup(fanItems, prof); // keep tray menu consistent
+  if (lblFanVal != null) lblFanVal.Text = (v * FACTOR).ToString("N0") + " RPM";
 }
 static void BriSliderChanged(object s, EventArgs e) {
   if (dashSyncing) return;
@@ -1524,41 +1679,38 @@ static void LedComboChanged(object s, EventArgs e) {
 static void SmoothChanged(object s, EventArgs e) {
   if (dashSyncing) return;
   try { ApplySmooth(tbSmooth.Value); } catch { }
-  if (lblSmoothVal != null) lblSmoothVal.Text = smooth.ToString();
+  SyncDash();
   SaveConfig();
 }
 static void LayoutColors() {
-  if (cbLed == null) return;
-  bool isStatic = (led == "static");
-  foreach (var kv in colorSwatches) { try { kv.Value.Enabled = isStatic; } catch { } }
-}
-static void LoadDashState() {
-  // seed control state from globals (called once at build)
+  foreach (var swatch in colorSwatches) {
+    bool selected = led == "static" && string.Equals(ledColor, swatch.Key, StringComparison.OrdinalIgnoreCase);
+    swatch.Value.FlatAppearance.BorderColor = selected ? Color.White : SlateBorder;
+    swatch.Value.FlatAppearance.BorderSize = selected ? 3 : 1;
+  }
 }
 static void SyncDash() {
   if (dash == null || dash.IsDisposed) return;
   try {
     dashSyncing = true;
-    // profile buttons highlight
-    foreach (Button b in profBtns) {
-      string tag = "";
-      if (b.Text == "Quiet") tag = "quiet"; else if (b.Text == "Balanced") tag = "balanced";
-      else if (b.Text == "Performance") tag = "performance"; else if (b.Text == "Turbo") tag = "turbo";
-      bool on = (!manual) && string.Equals(prof, tag, StringComparison.OrdinalIgnoreCase);
-      b.BackColor = on ? Color.FromArgb(40, 130, 78) : Color.FromArgb(38, 42, 50);
-      b.FlatAppearance.BorderColor = on ? Color.FromArgb(120, 220, 160) : Color.FromArgb(70, 76, 86);
-      activeProfBtn = on ? b : activeProfBtn;
+    foreach (Button button in profBtns) {
+      bool selected = manual ? button.Text == "Manual" :
+        string.Equals(prof, button.Text, StringComparison.OrdinalIgnoreCase);
+      button.BackColor = selected ? Color.FromArgb(29, 73, 103) : SlatePanel;
+      button.FlatAppearance.BorderColor = selected ? SlateAccent : SlateBorder;
+      button.AccessibleDescription = selected ? "Selected fan profile" : "";
     }
-    if (ckManual != null) ckManual.Checked = manual;
-    if (tbFan != null) { tbFan.Enabled = manual; if (tbFan.Value != manualUnit) { tbFan.Value = Math.Max(MIN_UNIT, Math.Min(MAX_UNIT, manualUnit)); } }
-    if (lblFanVal != null) lblFanVal.Text = (manualUnit * FACTOR).ToString() + " rpm";
-    // led effect
-    string ledSel = led; if (ledSel == "static") ledSel = "static";
-    if (cbLed != null) { int idx = cbLed.Items.IndexOf(ledSel); if (idx >= 0) cbLed.SelectedIndex = idx; }
-    // color swatches highlight (a thin green border on the active one)
-    foreach (var kv in colorSwatches) {
-      try { kv.Value.BorderStyle = (led == "static" && string.Equals(ledColor, kv.Key, StringComparison.OrdinalIgnoreCase)) ? BorderStyle.Fixed3D : BorderStyle.FixedSingle; } catch { }
-    }
+    bool automatic = !manual && prof != "turbo";
+    automaticControls.Visible = automatic;
+    manualControls.Visible = manual;
+    turboControls.Visible = !manual && !automatic;
+    ckLoadBoost.Visible = automatic;
+    ckWearCap.Visible = automatic;
+    ckSteady.Visible = automatic;
+    tbFan.Value = Math.Max(MIN_UNIT, Math.Min(MAX_UNIT, manualUnit));
+    lblFanVal.Text = (manualUnit * FACTOR).ToString("N0") + " RPM";
+    int effect = cbLed.Items.IndexOf(led);
+    cbLed.SelectedIndex = effect;
     LayoutColors();
     if (tbBri != null && tbBri.Value != bri) tbBri.Value = Math.Max(0, Math.Min(100, bri));
     if (lblBriVal != null) lblBriVal.Text = bri.ToString() + "%";
@@ -1571,19 +1723,14 @@ static void SyncDash() {
     if (ckNightDim != null) ckNightDim.Checked = nightDim;
     if (ckHyper != null) ckHyper.Checked = hyperBoost;
     if (tbSmooth != null && tbSmooth.Value != smooth) tbSmooth.Value = Math.Max(0, Math.Min(100, smooth));
-    if (lblSmoothVal != null) lblSmoothVal.Text = smooth.ToString();
+    if (lblSmoothVal != null) lblSmoothVal.Text = smooth + "%";
     if (ckAutoStart != null) ckAutoStart.Checked = IsAutostartEnabled();
-    if (btnPause != null) { btnPause.Text = paused ? "Resume" : "Pause"; btnPause.BackColor = paused ? Color.FromArgb(120, 90, 30) : Color.FromArgb(38, 42, 50); }
+    btnPause.Text = paused ? "Resume" : "Pause";
     dashSyncing = false;
   } catch (Exception ex) { dashSyncing = false; try { LogCrash("SyncDash: " + ex.Message); } catch { } }
 }
 // per-toggle handlers wired after Check() so each writes exactly one setting
 static void WireToggles() {
-  if (ckManual != null) ckManual.CheckedChanged += new EventHandler(delegate (object s, EventArgs e) {
-    if (dashSyncing) return;
-    lock (cfgLock) { manual = ckManual.Checked; if (tbFan != null) manualUnit = tbFan.Value; }
-    SaveConfig(); ledDirty = true; if (tbFan != null) tbFan.Enabled = manual;
-  });
   if (ckAutoTurbo != null) ckAutoTurbo.CheckedChanged += new EventHandler(delegate (object s, EventArgs e) {
     if (dashSyncing) return;
     autoTurbo = ckAutoTurbo.Checked; SaveConfig();
@@ -1624,32 +1771,26 @@ static void WireToggles() {
     SetAutostart(ckAutoStart.Checked);
   });
 }
-static void DashTick(object s, EventArgs e) {
-  if (dash == null || dash.IsDisposed) { if (dashTimer != null) dashTimer.Stop(); return; }
-  try {
-    int c = curCpu, g = curGpu, r = curRpm;
-    if (lblCpu != null) lblCpu.Text = (c < 0 ? "--" : c + " C");
-    if (lblGpu != null) lblGpu.Text = (g < 0 ? "--" : g + " C");
-    if (lblFan != null) lblFan.Text = (r < 0 ? "--" : r.ToString());
-    if (lblHead != null) {
-      string mode = manual ? "MANUAL" : prof;
-      string tail = "";
-      if (paused) tail = "  (paused)";
-      else if (!string.IsNullOrEmpty(curStatus) && curStatus.Contains("[HOT]")) tail = "  [HOT]";
-      else if (!string.IsNullOrEmpty(curStatus) && curStatus.Contains("[TURBO]")) tail = "  [TURBO]";
-      else if (NotExpired(Environment.TickCount, manualTurboUntil)) tail = "  [TURBO BURST]";
-      lblHead.Text = "Razer USB cooling pad  -  mode " + mode + tail + "   -   cap " + (rpmCap > 0 ? rpmCap.ToString() : "off") + "rpm   -   HyperBoost " + (hyperBoost ? "ON" : "off");
-    }
-    if (lblMode != null) {
-      string m = manual ? "MANUAL" : (paused ? "PAUSE" : (prof.Length > 5 ? prof.Substring(0, 5).ToUpperInvariant() : prof.ToUpperInvariant()));
-      lblMode.Text = m;
-    }
-    // don't yank sliders the user is actively dragging
-    if (!dashSyncing) {
-      if (tbFan != null && manual && tbFan.Value != manualUnit) tbFan.Value = Math.Max(MIN_UNIT, Math.Min(MAX_UNIT, manualUnit));
-    }
-  } catch (Exception ex) { try { LogCrash("DashTick: " + ex.Message); } catch { } }
+static void DashTick(object sender, EventArgs e) {
+  if (dash == null || dash.IsDisposed) return;
+  int cpu = curCpu, gpu = curGpu, rpm = curRpm;
+  lblCpu.Text = cpu < 0 ? "--" : cpu + " °C";
+  lblGpu.Text = gpu < 0 ? "--" : gpu + " °C";
+  lblFan.Text = rpm < 0 ? "-- RPM" : rpm.ToString("N0") + " RPM";
+  speedMeter.Invalidate();
+  bool connected = devH != new IntPtr(-1);
+  lblHead.Text = connected ? "USB connected  ·  Commanded speed" : "USB disconnected";
+  int now = Environment.TickCount, deadline = Volatile.Read(ref manualTurboUntil);
+  int seconds = NotExpired(now, deadline) ? (unchecked(deadline - now) + 999) / 1000 : 0;
+  btnTurbo.Enabled = !paused && connected;
+  btnTurbo.Text = seconds > 0 ? "End Burst · " + TimeSpan.FromSeconds(seconds).ToString(@"m\:ss") : "Turbo Burst · 2 min";
+  string reason = fanOverride;
+  overrideStatus.Text = paused ? "Fan control paused" :
+    connected && reason == "Critical temperature" ? reason + " override" :
+    connected && seconds > 0 ? "Turbo Burst override" :
+    connected && reason == "Auto-Turbo" ? reason + " override" : " ";
 }
+
 static void DashClosing(object s, FormClosingEventArgs e) {
   // Close (X) hides the window to the tray unless the user chose "Exit" (exiting=true).
   if (!exiting) {

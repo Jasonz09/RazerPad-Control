@@ -226,7 +226,12 @@ instance - a live process locks its own exe.
   - Defaults to **off**, so installing this build does not silently change your power plan; flip it on
     when you want maximum sustained GPU throughput and accept the slightly higher idle power draw.
 
-* **v8 (current)** - the **dashboard app** and the **anti-hunting fan controller**:
+* **Compact Slate (current)** - a single-screen dashboard with CPU/GPU temperatures, commanded fan
+  speed, Lighting, and HyperBoost. Quiet, Balanced, and Performance show Fan steadiness. Manual
+  shows a 500–3,200 RPM target, and Turbo holds 3,200 RPM. The two-minute Turbo Burst runs independently
+  of Auto-Turbo, and critical-temperature protection takes priority in every fan profile.
+
+* **v8** - the **dashboard app** and the **anti-hunting fan controller**:
   - A real Synapse-style **dashboard window** (open from the tray - Open dashboard): live CPU/GPU
     temperature and fan-RPM tiles, profile picker, lighting picker, brightness, a **Fan steadiness**
     slider, every toggle, and Start-with-Windows - all in one place.
