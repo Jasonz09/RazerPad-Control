@@ -425,8 +425,6 @@ static bool keepOnExit = false;
 // ---------- v3 additions ----------
 static bool idleDim = true;        // dim the light bar while the laptop is cool/idle
 static bool nightDim = false;      // dim the light bar between 22:00 and 07:00
-const int IDLE_BRI = 25;
-const int NIGHT_BRI = 25;
 static volatile string fanOverride = "";
 static double gpuCache = -1;       // latest GPU temp from the background sampler
 static long gpuSampleTimestamp;
@@ -627,6 +625,13 @@ static void TintFrame(byte[] frame, byte[] color, string mode, double phase) {
   }
 }
 
+static int EffectiveLightingBrightness(int requested, double temperature, int hour,
+                                       bool dimIdle, bool dimNight, bool alert) {
+  bool cool = dimIdle && temperature >= 0 && temperature < 45;
+  bool night = dimNight && (hour >= 22 || hour < 7);
+  return !alert && (cool || night) ? (requested + 1) / 2 : requested;
+}
+
 static void LedLoop() {
   var clock = Stopwatch.StartNew();
   string previousMode = "";
@@ -666,9 +671,7 @@ static void LedLoop() {
     double temp = Math.Max(curCpu, curGpu);
     bool criticalBlink = critical > 0 && temp >= critical && !isPaused;
     int requestedBrightness = brightness;
-    if (dimIdle && temp >= 0 && temp < 45 && !criticalBlink) brightness = Math.Min(brightness, IDLE_BRI);
-    int hour = DateTime.Now.Hour;
-    if (!criticalBlink && dimNight && (hour >= 22 || hour < 7)) brightness = Math.Min(brightness, NIGHT_BRI);
+    brightness = EffectiveLightingBrightness(brightness, temp, DateTime.Now.Hour, dimIdle, dimNight, criticalBlink);
 
     byte[] custom = customColor == null ? null : HexTo3(customColor);
     byte[] baseRgb = colorDraft.HasValue
@@ -824,7 +827,7 @@ static void ApplyHyperBoost(bool on) {
       foreach (string mode in lightingModes)
         if (d.TryGetValue("color." + mode, out sv) && sv.Length == 6 && HexTo3(sv) != null)
           effectColors[mode] = sv;
-      bri = GetInt(d, "bri", bri);
+      bri = Limit(GetInt(d, "bri", bri), 0, 100);
       ReadEffectLibrary(d);
       interval = GetInt(d, "interval", interval);
       critical = GetInt(d, "critical", critical);
@@ -837,7 +840,7 @@ static void ApplyHyperBoost(bool on) {
       bool hasProfile = d.TryGetValue("profile", out sv);
       FanMode savedMode = hasProfile ? ParseFanMode(sv) : fanMode;
       fanMode = GetBool(d, "manual", savedMode == FanMode.Manual) ? FanMode.Manual : savedMode;
-      manualUnit = GetInt(d, "manualunit", manualUnit);
+      manualUnit = Limit(GetInt(d, "manualunit", manualUnit), MIN_UNIT, MAX_UNIT);
     } catch { }
   }
 }
@@ -962,26 +965,26 @@ static void WaitForFanLoop(Stopwatch clock, long start, int intervalMs) {
 }
 
 static System.Drawing.Icon MakeIcon(int temp) {
-  Bitmap bmp = new Bitmap(32, 32);
-  using (Graphics g = Graphics.FromImage(bmp)) {
-    g.Clear(Color.Transparent);
-    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-    int hue;
-    if (temp < 0) hue = 210; else { double f = (temp - 45.0) / 45.0; if (f < 0) f = 0; if (f > 1) f = 1; hue = (int)Math.Round(120.0 - 120.0 * f); }
-    int r, gg, b; HSV(hue, 90, 100, out r, out gg, out b);
-    Color c = Color.FromArgb(r, gg, b);
-    using (SolidBrush br = new SolidBrush(c)) g.FillEllipse(br, 2, 2, 28, 28);
-    using (Pen pen = new Pen(Color.FromArgb(220, 255, 255, 255), 2)) g.DrawEllipse(pen, 2, 2, 28, 28);
-    using (SolidBrush w = new SolidBrush(Color.White))
-    using (Font f2 = new Font("Segoe UI", 11, FontStyle.Bold)) {
-      string t = temp < 0 ? "?" : temp.ToString();
-      SizeF sz = g.MeasureString(t, f2);
-      g.DrawString(t, f2, w, (32 - sz.Width) / 2f, (32 - sz.Height) / 2f);
+  using (Bitmap bmp = new Bitmap(32, 32)) {
+    using (Graphics g = Graphics.FromImage(bmp)) {
+      g.Clear(Color.Transparent);
+      g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+      double fraction = Math.Max(0, Math.Min(1, (temp - 45.0) / 45.0));
+      int hue = temp < 0 ? 210 : (int)Math.Round(120.0 * (1 - fraction));
+      int r, green, b;
+      HSV(hue, 90, 100, out r, out green, out b);
+      using (var brush = new SolidBrush(Color.FromArgb(r, green, b))) g.FillEllipse(brush, 2, 2, 28, 28);
+      using (var pen = new Pen(Color.FromArgb(220, 255, 255, 255), 2)) g.DrawEllipse(pen, 2, 2, 28, 28);
+      using (var brush = new SolidBrush(Color.White))
+      using (var font = new Font("Segoe UI", 11, FontStyle.Bold)) {
+        string label = temp < 0 ? "?" : temp.ToString();
+        SizeF size = g.MeasureString(label, font);
+        g.DrawString(label, font, brush, (32 - size.Width) / 2f, (32 - size.Height) / 2f);
+      }
     }
+    curIconH = bmp.GetHicon();
+    return System.Drawing.Icon.FromHandle(curIconH);
   }
-  IntPtr ico = bmp.GetHicon();
-  curIconH = ico;
-  return System.Drawing.Icon.FromHandle(ico);
 }
 
 static ToolStripMenuItem Radio(ref List<ToolStripMenuItem> group, string text, string tag, EventHandler onClick) {
@@ -1049,6 +1052,7 @@ static void IdleDimClick(object s, EventArgs e) {
   mi.Checked = idleDim;
   ledDirty = true;
   SaveConfig();
+  SyncDash();
 }
 static void NightDimClick(object s, EventArgs e) {
   ToolStripMenuItem mi = (ToolStripMenuItem)s;
@@ -1056,6 +1060,7 @@ static void NightDimClick(object s, EventArgs e) {
   mi.Checked = nightDim;
   ledDirty = true;
   SaveConfig();
+  SyncDash();
 }
 static void CoolTailClick(object s, EventArgs e) {
   ToolStripMenuItem mi = (ToolStripMenuItem)s;
@@ -1097,7 +1102,7 @@ static void SetAutostart(bool on) {
   try {
     using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey)) {
       if (k == null) return;
-      if (on) k.SetValue(RunValue, "\"" + ExePath() + "\" --minimized --status-file \"" + Path.Combine(Path.GetDirectoryName(ExePath()), "status.txt") + "\"");
+      if (on) k.SetValue(RunValue, "\"" + ExePath() + "\" --minimized --status-file \"" + statusFilePath + "\"");
       else if (k.GetValue(RunValue) != null) k.DeleteValue(RunValue, false);
     }
   } catch (Exception ax) { try { LogCrash("autostart: " + ax.Message); } catch { } }
@@ -1172,7 +1177,15 @@ static ContextMenuStrip BuildMenu() {
   m.Items.Add(new ToolStripSeparator());
   ToolStripMenuItem asu = new ToolStripMenuItem("Start with Windows");
   asu.Checked = IsAutostartEnabled();
-  asu.Click += new EventHandler(delegate (object s2, EventArgs e2) { asu.Checked = !asu.Checked; SetAutostart(asu.Checked); });
+  asu.Click += delegate { SetAutostart(!IsAutostartEnabled()); SyncDash(); };
+  m.Opening += delegate {
+    idm.Checked = idleDim;
+    ndm.Checked = nightDim;
+    asu.Checked = IsAutostartEnabled();
+    CheckGroup(fanItems, fanMode.ToString());
+    CheckGroup(ledItems, led == "static" ? "static:" + ledColor : CanonicalEffect(led));
+    CheckGroup(briItems, bri.ToString());
+  };
   m.Items.Add(asu);
   ToolStripMenuItem pause = new ToolStripMenuItem("Pause automation");
   pause.Click += new EventHandler(PauseClick);
@@ -1857,15 +1870,86 @@ static RoundedButton GraphiteButton(string text) {
 }
 
 sealed class InstrumentSlider : TrackBar {
+  const int KeyDownMessage = 0x0100;
+  const int MouseMoveMessage = 0x0200;
+  const int LeftDownMessage = 0x0201;
+  const int LeftUpMessage = 0x0202;
+  const int LeftDoubleClickMessage = 0x0203;
   const int MouseWheelMessage = 0x020A;
+  const int RailInset = 12;
+  const int ThumbRadius = 7;
   int pendingWheelDelta;
+  bool dragging;
+  int startValue;
+  float dragOffset;
+
+  public event EventHandler ValueCommitted;
+
+  int RailWidth { get { return Math.Max(1, ClientSize.Width - RailInset * 2); } }
+  float ThumbX {
+    get { return RailInset + RailWidth * (Value - Minimum) / (float)Math.Max(1, Maximum - Minimum); }
+  }
 
   public InstrumentSlider() {
     SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
              ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    Cursor = Cursors.Hand;
+  }
+
+  void SetFromPointer(int x) {
+    float ratio = (x - dragOffset - RailInset) / RailWidth;
+    Value = Limit(Minimum + (int)Math.Round(ratio * (Maximum - Minimum)), Minimum, Maximum);
+  }
+
+  bool MoveFromKey(Keys key) {
+    int target;
+    switch (key) {
+      case Keys.Left: case Keys.Down: target = Value - SmallChange; break;
+      case Keys.Right: case Keys.Up: target = Value + SmallChange; break;
+      case Keys.PageDown: target = Value - LargeChange; break;
+      case Keys.PageUp: target = Value + LargeChange; break;
+      case Keys.Home: target = Minimum; break;
+      case Keys.End: target = Maximum; break;
+      default: return false;
+    }
+    Value = Limit(target, Minimum, Maximum);
+    return true;
+  }
+
+  void CommitValue() {
+    if (ValueCommitted != null) ValueCommitted(this, EventArgs.Empty);
+  }
+
+  protected override void OnMouseCaptureChanged(EventArgs e) {
+    base.OnMouseCaptureChanged(e);
+    if (!dragging || Capture) return;
+    dragging = false;
+    if (Value != startValue) CommitValue();
   }
 
   protected override void WndProc(ref Message message) {
+    // Native navigation can move the thumb without notifying the managed control.
+    if (message.Msg == KeyDownMessage && MoveFromKey((Keys)message.WParam.ToInt32())) {
+      message.Result = IntPtr.Zero;
+      return;
+    }
+    int x = unchecked((short)message.LParam.ToInt64());
+    if (message.Msg == LeftDownMessage || message.Msg == LeftDoubleClickMessage) {
+      Focus();
+      startValue = Value;
+      dragging = true;
+      dragOffset = Math.Abs(x - ThumbX) <= ThumbRadius ? x - ThumbX : 0;
+      Capture = true;
+      SetFromPointer(x);
+      message.Result = IntPtr.Zero;
+      return;
+    }
+    if (dragging && (message.Msg == MouseMoveMessage || message.Msg == LeftUpMessage)) {
+      SetFromPointer(x);
+      if (message.Msg == LeftUpMessage) Capture = false;
+      message.Result = IntPtr.Zero;
+      return;
+    }
     if (message.Msg == MouseWheelMessage) {
       // Consume wheel input here so the native trackbar cannot move or paint its own thumb.
       pendingWheelDelta += unchecked((short)(message.WParam.ToInt64() >> 16));
@@ -1882,24 +1966,23 @@ sealed class InstrumentSlider : TrackBar {
   protected override void OnValueChanged(EventArgs e) {
     base.OnValueChanged(e);
     Invalidate();
+    if (!dragging) CommitValue();
   }
 
   protected override void OnPaint(PaintEventArgs e) {
     e.Graphics.Clear(BackColor);
     e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-    const int left = 12;
-    int width = Math.Max(0, ClientSize.Width - left * 2);
     int y = ClientSize.Height / 2;
-    float thumb = left + width * (Value - Minimum) / (float)(Maximum - Minimum);
-    var handle = new RectangleF(thumb - 7, y - 7, 14, 14);
+    float thumb = ThumbX;
+    var handle = new RectangleF(thumb - ThumbRadius, y - ThumbRadius, ThumbRadius * 2, ThumbRadius * 2);
     using (Pen rail = new Pen(SurfaceEdge, 6))
     using (Pen progress = new Pen(GraphiteAccent, 5))
     using (Brush shadow = new SolidBrush(Color.FromArgb(90, Color.Black)))
     using (Brush fill = new LinearGradientBrush(handle, Color.FromArgb(197, 228, 255), GraphiteAccent, 90f)) {
       rail.StartCap = rail.EndCap = System.Drawing.Drawing2D.LineCap.Round;
       progress.StartCap = progress.EndCap = System.Drawing.Drawing2D.LineCap.Round;
-      e.Graphics.DrawLine(rail, left, y, left + width, y);
-      e.Graphics.DrawLine(progress, left, y, thumb, y);
+      e.Graphics.DrawLine(rail, RailInset, y, RailInset + RailWidth, y);
+      if (Value > Minimum) e.Graphics.DrawLine(progress, RailInset, y, thumb, y);
       e.Graphics.FillEllipse(shadow, thumb - 9, y - 6, 18, 18);
       e.Graphics.FillEllipse(fill, handle);
     }
@@ -1907,7 +1990,8 @@ sealed class InstrumentSlider : TrackBar {
   }
 }
 
-static TrackBar AddSlider(TableLayoutPanel grid, string name, int min, int max, out Label value, EventHandler changed) {
+static TrackBar AddSlider(TableLayoutPanel grid, string name, int min, int max, out Label value, EventHandler changed,
+                          bool persist = false) {
   TableLayoutPanel heading = GraphiteGrid(2);
   heading.ColumnStyles.Clear();
   heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 57));
@@ -1917,12 +2001,13 @@ static TrackBar AddSlider(TableLayoutPanel grid, string name, int min, int max, 
   value.TextAlign = ContentAlignment.MiddleRight;
   GraphiteAdd(heading, value, 1, 0);
   GraphiteAdd(grid, heading);
-  TrackBar slider = new InstrumentSlider {
+  var slider = new InstrumentSlider {
     Minimum = min, Maximum = max, Value = min, SmallChange = 1, LargeChange = 5,
     TickStyle = TickStyle.None, AutoSize = false, Height = 25,
     Margin = Padding.Empty, BackColor = GraphiteBackground, AccessibleName = name
   };
   slider.ValueChanged += changed;
+  if (persist) slider.ValueCommitted += delegate { if (!dashSyncing) SaveConfig(); };
   GraphiteAdd(grid, slider);
   return slider;
 }
@@ -1991,14 +2076,13 @@ static void FanSliderChanged(object s, EventArgs e) {
   if (dashSyncing) return;
   int v = tbFan.Value;
   lock (cfgLock) manualUnit = v;
-  SaveConfig();
   if (lblFanVal != null) lblFanVal.Text = (v * FACTOR).ToString("N0") + " RPM";
 }
 static void BriSliderChanged(object s, EventArgs e) {
   if (dashSyncing) return;
   int v = tbBri.Value;
   SetLightingBrightness(v);
-  ledDirty = true; SaveConfig();
+  ledDirty = true;
   CheckGroup(briItems, v.ToString());
   if (lblBriVal != null) lblBriVal.Text = v.ToString() + "%";
   if (lightingPreview != null) lightingPreview.Invalidate();
@@ -2021,8 +2105,8 @@ static void SyncDash() {
       button.AccessibleDescription = selected ? "Selected fan profile" : "";
     }
     manualControls.Visible = currentMode == FanMode.Manual;
-    fanModeSummary.Text = currentMode == FanMode.Manual ? "Holds the set speed" :
-      currentMode == FanMode.Quiet ? "Up to 1,900 RPM normally" : "Up to 2,300 RPM normally";
+    fanModeSummary.Visible = currentMode != FanMode.Manual;
+    fanModeSummary.Text = currentMode == FanMode.Quiet ? "Up to 1,900 RPM normally" : "Up to 2,300 RPM normally";
     tbFan.Value = Math.Max(MIN_UNIT, Math.Min(MAX_UNIT, manualUnit));
     lblFanVal.Text = (manualUnit * FACTOR).ToString("N0") + " RPM";
     lightingGallery.SyncSelection();
@@ -2059,6 +2143,7 @@ static void WireToggles() {
   if (ckAutoStart != null) ckAutoStart.CheckedChanged += new EventHandler(delegate (object s, EventArgs e) {
     if (dashSyncing) return;
     SetAutostart(ckAutoStart.Checked);
+    SyncDash();
   });
 }
 static void DashTick(object sender, EventArgs e) {
@@ -2232,9 +2317,10 @@ static void Main(string[] args) {
     cfgWatcher = new FileSystemWatcher();
     cfgWatcher.Path = Path.GetDirectoryName(cfgp);
     cfgWatcher.Filter = Path.GetFileName(cfgp);
-    cfgWatcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size;
+    cfgWatcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size;
     cfgWatcher.Changed += new FileSystemEventHandler(CfgChanged);
     cfgWatcher.Created += new FileSystemEventHandler(CfgChanged);
+    cfgWatcher.Renamed += new RenamedEventHandler(CfgChanged);
     cfgWatcher.EnableRaisingEvents = true;
   } catch { }
 

@@ -55,7 +55,8 @@ internal static partial class Program {
         nextNormalReview = now + ReviewMs;
       }
 
-      if (command < 0) command = normalUnit;
+      // A temperature override may hold the fan above the normal target, never below it.
+      command = Math.Max(command, normalUnit);
       if (!HasTemperature) {
         if (!Emergency && (modeChanged || mode == FanMode.Manual)) command = normalUnit;
         return command;

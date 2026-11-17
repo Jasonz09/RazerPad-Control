@@ -32,7 +32,7 @@ Open the dashboard for the full interface, or use the tray icon for quick contro
 | **Fan mode** | Automatic, Quiet, or Manual |
 | **Device settings** | Fan wind-down on exit and HyperBoost |
 | **Lighting** | Heatmap (temp) - Temperature meter (bar graph) - Wave (flowing, temp-tinted) - **Load meter (CPU bar left / GPU bar right)** - Spectrum cycle - Breathing (speed follows temperature) - Rainbow - Static color (White/Green/Cyan/Blue/Red/Purple/Orange/Pink) - Off |
-| **Brightness** | 25 / 50 / 75 / 100 % ; Dim automatically when idle/cool ; Dim automatically at night (22:00-07:00) |
+| **Brightness** | 25 / 50 / 75 / 100% presets. Auto-dim uses half the selected brightness when idle/cool or during 22:00–07:00. |
 | **Pause / Resume automation** | hands control back to you, freezes the loop |
 | **Exit** | stops the app, restores the fan to a quiet rest speed, puts the pad back into onboard Auto mode, turns the LEDs off |
 

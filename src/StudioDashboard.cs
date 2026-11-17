@@ -57,6 +57,12 @@ internal static partial class Program {
     }
     fanModeSummary = GraphiteText("", 9, WorkspaceMuted);
     GraphiteAdd(command, fanModeSummary);
+    var fixedSpeed = GraphiteGrid(1);
+    manualControls = fixedSpeed;
+    tbFan = AddSlider(fixedSpeed, "Target speed", MIN_UNIT, MAX_UNIT, out lblFanVal, FanSliderChanged, persist: true);
+    tbFan.BackColor = GraphitePanel;
+    tbFan.AccessibleDescription = "500 to 3,200 RPM in 50 RPM steps";
+    GraphiteAdd(command, fixedSpeed);
     GraphiteAdd(instruments, command, 1, 0);
     GraphiteAdd(layout, instruments);
 
@@ -75,22 +81,17 @@ internal static partial class Program {
     GraphiteAdd(footer, readouts, 0, 0);
     btnPause = GraphiteButton("Pause");
     btnPause.Width = 150;
-    btnPause.Margin = new Padding(0, 15, 0, 0);
     btnPause.CornerRadius = 10;
     btnPause.Image = InstrumentIcon("Pause");
     btnPause.TextImageRelation = TextImageRelation.ImageBeforeText;
     btnPause.Click += PauseClick;
     GraphiteAdd(footer, btnPause, 1, 0);
-    btnPause.Dock = DockStyle.Right;
+    btnPause.Dock = DockStyle.None;
+    btnPause.Anchor = AnchorStyles.Right;
     GraphiteAdd(layout, footer);
     overrideStatus = GraphiteText("", 9, WorkspaceMuted);
     GraphiteAdd(layout, overrideStatus);
 
-    var fixedSpeed = GraphiteGrid(1);
-    manualControls = fixedSpeed;
-    tbFan = AddSlider(fixedSpeed, "Target speed", MIN_UNIT, MAX_UNIT, out lblFanVal, FanSliderChanged);
-    GraphiteAdd(fixedSpeed, GraphiteText("500–3,200 RPM in 50 RPM steps", 8, WorkspaceMuted));
-    GraphiteAdd(layout, fixedSpeed);
     return page;
   }
 

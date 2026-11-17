@@ -103,7 +103,7 @@ internal static partial class Program {
 
       var options = GraphiteGrid(1);
       lightingOptions = options;
-      tbBri = AddSlider(options, "Brightness", 0, 100, out lblBriVal, BriSliderChanged);
+      tbBri = AddSlider(options, "Brightness", 0, 100, out lblBriVal, BriSliderChanged, persist: true);
       ckIdleDim = AddCheck(options, "Dim when idle or cool");
       ckNightDim = AddCheck(options, "Dim at night (22:00–07:00)");
       AddDisclosure(layout, "Lighting options", options);
