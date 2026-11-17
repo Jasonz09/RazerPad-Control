@@ -446,11 +446,11 @@ const double Kd = 1.4;                    // only active while WARMING (damps ov
 const double IBAND_LO = 40, IBAND_HI = 80; // integrate only inside this band (no windup when cold / critical)
 const double IMAX = 14;                   // anti-windup clamp on the integral correction (+/-14 units = +/-700rpm)
 static int coast = 15;                  // anti-hunt: seconds the fan waits before easing DOWN one unit (slow coast-down, prevents pump up/down oscillation)
-// ---------- Compact Slate dashboard ----------
+// ---------- Compact Graphite dashboard ----------
 static Form dash;                      // the dashboard window (null = not open)
 static bool exiting = false;           // set when the user truly exits (so closing the window quits)
 static System.Windows.Forms.Timer dashTimer;   // ~500ms live-refresh for the open window
-static Label lblCpu, lblGpu, lblFan, lblHead;   // live read-outs
+static Label lblCpu, lblGpu, lblHead;   // live read-outs
 static TrackBar tbFan, tbBri;          // manual fan speed + LED brightness
 static Label lblFanVal, lblBriVal;     // slider value captions
 static ComboBox cbLed;                 // lighting effect selector
@@ -1311,10 +1311,10 @@ static void UiTick(object s, EventArgs e) {
 // ===================== v8 dashboard: a Synapse-style control window =====================
 // Shares the exact engine/threads/globals of the tray (tray stays the source of truth).
 // Every control writes the same globals + SaveConfig(), so window and tray menu stay in sync.
-static readonly Color SlateBackground = Color.FromArgb(16, 25, 38);
-static readonly Color SlatePanel = Color.FromArgb(24, 37, 54);
-static readonly Color SlateBorder = Color.FromArgb(61, 81, 105);
-static readonly Color SlateAccent = Color.FromArgb(110, 221, 245);
+static readonly Color GraphiteBackground = Color.FromArgb(15, 16, 17);
+static readonly Color GraphitePanel = Color.FromArgb(24, 25, 26);
+static readonly Color GraphiteBorder = Color.FromArgb(60, 62, 65);
+static readonly Color GraphiteAccent = Color.FromArgb(155, 248, 0);
 static Panel automaticControls, manualControls, turboControls, automationOptions, lightingOptions, deviceOptions, speedMeter;
 static Label overrideStatus;
 static ToolStripMenuItem pauseItem;
@@ -1333,62 +1333,79 @@ static void ShowDashboard() {
   Form window = new Form();
   window.Text = "RazerPad Control";
   Rectangle screen = Screen.FromPoint(Cursor.Position).WorkingArea;
-  window.ClientSize = new Size(Math.Min(788, Math.Max(380, screen.Width - 48)),
-                               Math.Min(520, Math.Max(320, screen.Height - 84)));
+  window.ClientSize = new Size(Math.Min(1152, Math.Max(680, screen.Width - 48)),
+                               Math.Min(715, Math.Max(460, screen.Height - 84)));
   window.StartPosition = FormStartPosition.CenterScreen;
-  window.BackColor = SlateBackground;
+  window.BackColor = GraphiteBackground;
   window.ForeColor = Color.FromArgb(232, 240, 250);
   window.Font = new Font("Segoe UI", 10f);
-  window.MinimumSize = new Size(420, 380);
+  window.MinimumSize = new Size(690, 475);
   window.AutoScaleMode = AutoScaleMode.Dpi;
   window.FormClosing += DashClosing;
   try { window.Icon = MakeIcon(Math.Max(0, Math.Max(curCpu, curGpu))); } catch { }
 
-  Panel scroll = new Panel { AutoScroll = true, Dock = DockStyle.Fill, Padding = new Padding(16) };
-  TableLayoutPanel layout = SlateGrid(1);
-  layout.Dock = DockStyle.Top;
-  scroll.Controls.Add(layout);
-  window.Controls.Add(scroll);
-
-  TableLayoutPanel telemetry = SlateGrid(3);
-  telemetry.ColumnStyles.Clear();
-  telemetry.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
-  telemetry.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 21));
-  telemetry.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 21));
-  telemetry.Padding = new Padding(10, 4, 10, 8);
-  telemetry.BackColor = SlatePanel;
-  SlateAdd(layout, telemetry);
-  TableLayoutPanel speed = SlateGrid(1);
-  speed.Margin = new Padding(0, 0, 12, 0);
-  lblFan = SlateText("-- RPM", 30, SlateAccent);
-  lblFan.AccessibleName = "Commanded fan speed";
-  speedMeter = new Panel { Height = 7, Margin = new Padding(2, 2, 0, 7), AccessibleName = "Fan speed indicator" };
-  speedMeter.Paint += delegate (object sender, PaintEventArgs e) {
-    const int segments = 18;
-    float width = (float)speedMeter.ClientSize.Width / segments;
-    int active = (Math.Max(0, curRpm) * segments + MAX_UNIT * FACTOR / 2) / (MAX_UNIT * FACTOR);
-    using (Brush fill = new SolidBrush(SlateAccent))
-    using (Brush track = new SolidBrush(SlateBorder)) {
-      for (int i = 0; i < segments; i++)
-        e.Graphics.FillRectangle(i < active ? fill : track, i * width, 0, Math.Max(0, width - 3), speedMeter.Height);
-    }
+  TableLayoutPanel shell = new TableLayoutPanel {
+    Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, CellBorderStyle = TableLayoutPanelCellBorderStyle.Single
   };
-  lblHead = SlateText("Connecting to cooling pad", 9, Color.LightSteelBlue);
-  SlateAdd(speed, lblFan);
-  SlateAdd(speed, speedMeter);
-  SlateAdd(speed, lblHead);
-  SlateAdd(telemetry, speed, 0, 0);
-  lblCpu = AddTemperature(telemetry, "CPU", 1);
-  lblGpu = AddTemperature(telemetry, "GPU", 2);
+  shell.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
+  shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55));
+  shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
+  shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+  window.Controls.Add(shell);
 
-  TableLayoutPanel profiles = SlateGrid(1);
+  FlowLayoutPanel navigation = new FlowLayoutPanel {
+    Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false,
+    Padding = new Padding(0, 20, 0, 0), Margin = Padding.Empty, BackColor = GraphiteBackground
+  };
+  shell.Controls.Add(navigation, 0, 0);
+
+  TableLayoutPanel telemetry = new TableLayoutPanel {
+    Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(18), Margin = Padding.Empty
+  };
+  telemetry.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+  telemetry.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+  telemetry.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
+  telemetry.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
+  shell.Controls.Add(telemetry, 1, 0);
+
+  speedMeter = new FanDial { Dock = DockStyle.Fill, AccessibleName = "Commanded fan speed" };
+  telemetry.Controls.Add(speedMeter, 0, 0);
+  TableLayoutPanel temperatures = GraphiteGrid(2);
+  temperatures.Dock = DockStyle.Fill;
+  telemetry.Controls.Add(temperatures, 0, 1);
+  lblCpu = AddTemperature(temperatures, "CPU", 0);
+  lblGpu = AddTemperature(temperatures, "GPU", 1);
+  lblHead = GraphiteText("Connecting to cooling pad", 10, Color.Silver);
+  lblHead.TextAlign = ContentAlignment.MiddleCenter;
+  lblHead.Dock = DockStyle.Fill;
+  telemetry.Controls.Add(lblHead, 0, 2);
+
+  TableLayoutPanel right = new TableLayoutPanel {
+    Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(16, 18, 16, 20), Margin = Padding.Empty
+  };
+  right.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+  right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+  right.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+  shell.Controls.Add(right, 2, 0);
+  Panel scroll = new Panel { AutoScroll = true, Dock = DockStyle.Fill, Margin = Padding.Empty };
+  right.Controls.Add(scroll, 0, 0);
+  TableLayoutPanel cooling = GraphiteGrid(1);
+  cooling.Dock = DockStyle.Top;
+  scroll.Controls.Add(cooling);
+
+  TableLayoutPanel profiles = GraphiteGrid(1);
   profiles.Margin = new Padding(0, 4, 0, 0);
-  SlateAdd(profiles, SlateText("Fan profile", 10, Color.LightSteelBlue));
-  TableLayoutPanel choices = SlateGrid(5);
+  GraphiteAdd(profiles, GraphiteText("Fan Profile", 14, Color.Silver));
+  TableLayoutPanel choices = GraphiteGrid(5);
   profBtns.Clear();
   foreach (string name in new[] { "Quiet", "Balanced", "Performance", "Turbo", "Manual" }) {
-    Button button = SlateButton(name);
-    button.Margin = new Padding(0, 0, 5, 0);
+    Button button = GraphiteButton(name);
+    button.Height = 68;
+    button.Font = new Font("Segoe UI", 8.5f);
+    button.AutoEllipsis = true;
+    button.Image = InstrumentIcon(name == "Manual" ? "Manual" : "Cooling");
+    button.TextImageRelation = TextImageRelation.ImageAboveText;
+    button.Margin = new Padding(0, 0, 2, 0);
     button.Click += delegate {
       lock (cfgLock) {
         manual = name == "Manual";
@@ -1399,52 +1416,49 @@ static void ShowDashboard() {
       ledDirty = true;
       SyncDash();
     };
-    SlateAdd(choices, button, profBtns.Count, 0);
+    GraphiteAdd(choices, button, profBtns.Count, 0);
     profBtns.Add(button);
   }
-  SlateAdd(profiles, choices);
-  SlateAdd(layout, profiles);
+  GraphiteAdd(profiles, choices);
+  GraphiteAdd(cooling, profiles);
+  AddInstrumentDivider(cooling);
 
-  TableLayoutPanel cards = SlateGrid(2);
-  TableLayoutPanel cooling = SlateCard("Cooling");
-  cooling.Margin = new Padding(0, 0, 6, 0);
-  TableLayoutPanel automatic = SlateGrid(1);
+  TableLayoutPanel automatic = GraphiteGrid(1);
   automaticControls = automatic;
-  tbSmooth = AddSlider(automatic, "Fan steadiness", 0, 100, out lblSmoothVal, SmoothChanged);
-  TableLayoutPanel sliderEnds = SlateGrid(2);
-  SlateAdd(sliderEnds, SlateText("More responsive", 8, Color.LightSteelBlue), 0, 0);
-  Label steadyEnd = SlateText("More steady", 8, Color.LightSteelBlue);
+  tbSmooth = AddSlider(automatic, "Fan Steadiness", 0, 100, out lblSmoothVal, SmoothChanged);
+  TableLayoutPanel sliderEnds = GraphiteGrid(2);
+  GraphiteAdd(sliderEnds, GraphiteText("More responsive", 8, Color.Silver), 0, 0);
+  Label steadyEnd = GraphiteText("More steady", 8, Color.Silver);
   steadyEnd.TextAlign = ContentAlignment.MiddleRight;
-  SlateAdd(sliderEnds, steadyEnd, 1, 0);
-  SlateAdd(automatic, sliderEnds);
-  SlateAdd(cooling, automatic);
+  GraphiteAdd(sliderEnds, steadyEnd, 1, 0);
+  GraphiteAdd(automatic, sliderEnds);
+  GraphiteAdd(cooling, automatic);
 
-  TableLayoutPanel fixedSpeed = SlateGrid(1);
+  TableLayoutPanel fixedSpeed = GraphiteGrid(1);
   manualControls = fixedSpeed;
   tbFan = AddSlider(fixedSpeed, "Target speed", MIN_UNIT, MAX_UNIT, out lblFanVal, FanSliderChanged);
-  SlateAdd(fixedSpeed, SlateText("500–3,200 RPM in 50 RPM steps", 8, Color.LightSteelBlue));
-  SlateAdd(cooling, fixedSpeed);
+  GraphiteAdd(fixedSpeed, GraphiteText("500–3,200 RPM in 50 RPM steps", 8, Color.Silver));
+  GraphiteAdd(cooling, fixedSpeed);
 
-  TableLayoutPanel maxSpeed = SlateGrid(1);
+  TableLayoutPanel maxSpeed = GraphiteGrid(1);
   turboControls = maxSpeed;
-  SlateAdd(maxSpeed, SlateText("3,200 RPM fixed speed", 12, SlateAccent));
-  SlateAdd(cooling, maxSpeed);
-  TableLayoutPanel automation = SlateGrid(1);
+  GraphiteAdd(maxSpeed, GraphiteText("3,200 RPM fixed speed", 12, GraphiteAccent));
+  GraphiteAdd(cooling, maxSpeed);
+  TableLayoutPanel automation = GraphiteGrid(1);
   automationOptions = automation;
   ckAutoTurbo = AddCheck(automation, "Auto-Turbo at high temperatures");
   ckLoadBoost = AddCheck(automation, "Boost fan ahead of load");
   ckWearCap = AddCheck(automation, "Limit fan speed while cool");
   ckSteady = AddCheck(automation, "Steady speed control");
-  AddDisclosure(cooling, "Fan automation", automation);
-  SlateAdd(cards, cooling, 0, 0);
-  cooling.Dock = DockStyle.Fill;
+  AddInstrumentDivider(cooling);
+  AddDisclosure(cooling, "Fan Automation", automation);
 
-  TableLayoutPanel lighting = SlateCard("Lighting");
+  TableLayoutPanel lighting = GraphiteCard("Lighting");
   lighting.Margin = new Padding(6, 0, 0, 0);
   cbLed = new ComboBox {
     DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
     DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 23, FormattingEnabled = true,
-    BackColor = SlateBackground, ForeColor = window.ForeColor, AccessibleName = "Lighting effect"
+    BackColor = GraphiteBackground, ForeColor = window.ForeColor, AccessibleName = "Lighting effect"
   };
   cbLed.Items.AddRange(new object[] { "heatmap", "level", "wave", "spectrum", "loadmeter", "breath", "rainbow", "static", "off" });
   cbLed.Format += delegate (object sender, ListControlConvertEventArgs e) {
@@ -1454,7 +1468,7 @@ static void ShowDashboard() {
   };
   cbLed.DrawItem += delegate (object sender, DrawItemEventArgs e) {
     bool selected = (e.State & DrawItemState.Selected) != 0;
-    using (Brush background = new SolidBrush(selected ? Color.FromArgb(29, 73, 103) : SlateBackground))
+    using (Brush background = new SolidBrush(selected ? Color.FromArgb(47, 67, 19) : GraphiteBackground))
       e.Graphics.FillRectangle(background, e.Bounds);
     if (e.Index >= 0) {
       Rectangle textBounds = Rectangle.Inflate(e.Bounds, -6, 0);
@@ -1464,11 +1478,11 @@ static void ShowDashboard() {
     e.DrawFocusRectangle();
   };
   cbLed.SelectedIndexChanged += LedComboChanged;
-  SlateAdd(lighting, cbLed);
-  TableLayoutPanel swatches = SlateGrid(8);
+  GraphiteAdd(lighting, cbLed);
+  TableLayoutPanel swatches = GraphiteGrid(8);
   colorSwatches.Clear();
   foreach (string name in new[] { "cyan", "blue", "purple", "pink", "red", "orange", "green", "white" }) {
-    Button swatch = SlateButton("");
+    Button swatch = GraphiteButton("");
     swatch.Height = 24;
     swatch.Margin = new Padding(0, 2, 5, 2);
     swatch.AccessibleName = name + " static lighting";
@@ -1480,55 +1494,84 @@ static void ShowDashboard() {
       ledDirty = true;
       SyncDash();
     };
-    SlateAdd(swatches, swatch, colorSwatches.Count, 0);
+    GraphiteAdd(swatches, swatch, colorSwatches.Count, 0);
     colorSwatches.Add(name, swatch);
   }
-  SlateAdd(lighting, swatches);
-  TableLayoutPanel lightSettings = SlateGrid(1);
+  GraphiteAdd(lighting, swatches);
+  TableLayoutPanel lightSettings = GraphiteGrid(1);
   lightingOptions = lightSettings;
   tbBri = AddSlider(lightSettings, "Brightness", 0, 100, out lblBriVal, BriSliderChanged);
   ckIdleDim = AddCheck(lightSettings, "Dim when idle or cool");
   ckNightDim = AddCheck(lightSettings, "Dim at night (22:00–07:00)");
   AddDisclosure(lighting, "Lighting options", lightSettings);
-  SlateAdd(cards, lighting, 1, 0);
-  lighting.Dock = DockStyle.Fill;
-  SlateAdd(layout, cards);
-
-  TableLayoutPanel bottom = SlateGrid(2);
-  TableLayoutPanel device = SlateCard("Device");
+  TableLayoutPanel device = GraphiteCard("Device");
   device.Margin = new Padding(0, 0, 6, 0);
   ckHyper = AddCheck(device, "HyperBoost (plugged in)");
-  TableLayoutPanel deviceSettings = SlateGrid(1);
+  TableLayoutPanel deviceSettings = GraphiteGrid(1);
   deviceOptions = deviceSettings;
   ckAutoStart = AddCheck(deviceSettings, "Start with Windows");
   ckCoolTail = AddCheck(deviceSettings, "Wind fan down on exit");
-  Button exit = SlateButton("Exit app");
+  Button exit = GraphiteButton("Exit app");
   exit.Click += ExitClick;
-  SlateAdd(deviceSettings, exit);
+  GraphiteAdd(deviceSettings, exit);
   AddDisclosure(device, "Device options", deviceSettings);
-  SlateAdd(bottom, device, 0, 0);
+  lighting.Dock = device.Dock = DockStyle.Top;
+  lighting.Hide();
+  device.Hide();
+  scroll.Controls.Add(lighting);
+  scroll.Controls.Add(device);
+  TableLayoutPanel[] pages = { cooling, lighting, device };
+  List<Button> navigationButtons = new List<Button>();
+  string[] pageNames = { "Cooling", "Lighting", "Device" };
+  for (int i = 0; i < pages.Length; i++) {
+    int selectedPage = i;
+    Button tab = GraphiteButton(pageNames[i]);
+    tab.Size = new Size(110, 88);
+    tab.Image = InstrumentIcon(pageNames[i]);
+    tab.TextImageRelation = TextImageRelation.ImageAboveText;
+    tab.FlatAppearance.BorderSize = 0;
+    tab.Margin = Padding.Empty;
+    tab.BackColor = i == 0 ? Color.FromArgb(33, 44, 18) : GraphiteBackground;
+    tab.ForeColor = i == 0 ? GraphiteAccent : Color.Silver;
+    tab.Click += delegate {
+      for (int index = 0; index < pages.Length; index++) {
+        bool active = index == selectedPage;
+        pages[index].Visible = active;
+        navigationButtons[index].BackColor = active ? Color.FromArgb(33, 44, 18) : GraphiteBackground;
+        navigationButtons[index].ForeColor = active ? GraphiteAccent : Color.Silver;
+      }
+      pages[selectedPage].BringToFront();
+    };
+    navigationButtons.Add(tab);
+    navigation.Controls.Add(tab);
+  }
 
-  TableLayoutPanel actions = SlateGrid(1);
-  actions.Margin = new Padding(6, 0, 0, 0);
-  overrideStatus = SlateText("", 9, Color.LightSteelBlue);
-  SlateAdd(actions, overrideStatus);
-  TableLayoutPanel buttons = SlateGrid(2);
+  TableLayoutPanel actions = GraphiteGrid(1);
+  actions.Dock = DockStyle.Top;
+  AddInstrumentDivider(actions);
+  overrideStatus = GraphiteText("", 9, Color.Silver);
+  GraphiteAdd(actions, overrideStatus);
+  TableLayoutPanel buttons = GraphiteGrid(2);
   buttons.ColumnStyles.Clear();
   buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
   buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 68));
-  btnPause = SlateButton("Pause");
+  btnPause = GraphiteButton("Pause");
+  btnPause.Height = 58;
+  btnPause.Image = InstrumentIcon("Pause");
+  btnPause.TextImageRelation = TextImageRelation.ImageBeforeText;
   btnPause.Margin = new Padding(0, 0, 5, 0);
   btnPause.Click += PauseClick;
-  btnTurbo = SlateButton("Turbo Burst · 2 min");
-  btnTurbo.BackColor = SlateAccent;
-  btnTurbo.ForeColor = SlateBackground;
-  btnTurbo.FlatAppearance.MouseOverBackColor = Color.FromArgb(155, 233, 249);
+  btnTurbo = GraphiteButton("Turbo Burst · 2 min");
+  btnTurbo.Height = 58;
+  btnTurbo.Font = new Font("Segoe UI Semibold", 11);
+  btnTurbo.BackColor = GraphiteAccent;
+  btnTurbo.ForeColor = GraphiteBackground;
+  btnTurbo.FlatAppearance.MouseOverBackColor = Color.FromArgb(187, 255, 57);
   btnTurbo.Click += TurboBurstClick;
-  SlateAdd(buttons, btnPause, 0, 0);
-  SlateAdd(buttons, btnTurbo, 1, 0);
-  SlateAdd(actions, buttons);
-  SlateAdd(bottom, actions, 1, 0);
-  SlateAdd(layout, bottom);
+  GraphiteAdd(buttons, btnPause, 0, 0);
+  GraphiteAdd(buttons, btnTurbo, 1, 0);
+  GraphiteAdd(actions, buttons);
+  right.Controls.Add(actions, 0, 1);
 
   dash = window;
   WireToggles();
@@ -1545,7 +1588,114 @@ static void ShowDashboard() {
   dashTimer.Start();
 }
 
-static TableLayoutPanel SlateGrid(int columns) {
+static void AddInstrumentDivider(TableLayoutPanel grid) {
+  Panel line = new Panel { Height = 1, BackColor = GraphiteBorder };
+  GraphiteAdd(grid, new Panel { Height = 12 });
+  GraphiteAdd(grid, line);
+  GraphiteAdd(grid, new Panel { Height = 12 });
+}
+
+static Bitmap InstrumentIcon(string kind) {
+  Bitmap image = new Bitmap(28, 28);
+  using (Graphics g = Graphics.FromImage(image))
+  using (Pen pen = new Pen(Color.Silver, 1.7f)) {
+    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+    switch (kind) {
+      case "Lighting":
+        g.DrawArc(pen, 6, 3, 16, 17, 145, 250);
+        g.DrawLines(pen, new[] { new Point(8, 16), new Point(11, 21), new Point(17, 21), new Point(20, 16) });
+        g.DrawLine(pen, 11, 24, 17, 24);
+        break;
+      case "Device":
+        g.DrawPolygon(pen, new[] { new Point(7, 6), new Point(21, 6), new Point(26, 21), new Point(2, 21) });
+        g.DrawLine(pen, 4, 24, 24, 24);
+        break;
+      case "Manual":
+        for (int i = 0; i < 3; i++) {
+          int y = 7 + i * 7, x = i == 1 ? 18 : 9;
+          g.DrawLine(pen, 3, y, x - 3, y);
+          g.DrawEllipse(pen, x - 3, y - 3, 6, 6);
+          g.DrawLine(pen, x + 3, y, 25, y);
+        }
+        break;
+      case "Pause":
+        g.FillRectangle(Brushes.Silver, 8, 5, 4, 18);
+        g.FillRectangle(Brushes.Silver, 16, 5, 4, 18);
+        break;
+      default:
+        g.TranslateTransform(14, 14);
+        PaintFan(g, 1);
+        break;
+    }
+  }
+  return image;
+}
+
+static void PaintFan(Graphics g, float scale) {
+  var state = g.Save();
+  g.ScaleTransform(scale, scale);
+  for (int i = 0; i < 4; i++) {
+    using (var blade = new System.Drawing.Drawing2D.GraphicsPath()) {
+      blade.AddBezier(1, -2, -4, -13, 9, -15, 9, -9);
+      blade.AddBezier(9, -9, 8, -5, 5, -3, 1, -2);
+      g.FillPath(Brushes.Silver, blade);
+    }
+    g.RotateTransform(90);
+  }
+  g.FillEllipse(Brushes.Silver, -2, -2, 4, 4);
+  g.Restore(state);
+}
+
+sealed class FanDial : Panel {
+  public FanDial() {
+    DoubleBuffered = true;
+    ResizeRedraw = true;
+  }
+
+  protected override void OnPaint(PaintEventArgs e) {
+    base.OnPaint(e);
+    int size = Math.Min(ClientSize.Width, ClientSize.Height);
+    if (size < 40) return;
+    Graphics g = e.Graphics;
+    var state = g.Save();
+    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+    g.TranslateTransform(ClientSize.Width / 2f, ClientSize.Height / 2f);
+    g.ScaleTransform(size / 440f, size / 440f);
+    using (var surface = new System.Drawing.Drawing2D.HatchBrush(
+      System.Drawing.Drawing2D.HatchStyle.LightDownwardDiagonal, Color.FromArgb(22, 24, 22), GraphiteBackground))
+      g.FillEllipse(surface, -190, -190, 380, 380);
+    using (Pen rim = new Pen(GraphiteBorder, 6))
+      g.DrawArc(rim, -208, -208, 416, 416, 135, 270);
+    const int segments = 56;
+    int rpm = curRpm;
+    int active = Math.Min(segments, Math.Max(0, rpm) * segments / (MAX_UNIT * FACTOR));
+    using (Pen lit = new Pen(GraphiteAccent, 19))
+    using (Pen unlit = new Pen(GraphiteBorder, 19))
+    using (Pen tick = new Pen(Color.Silver, 1.4f)) {
+      for (int i = 0; i < segments; i++)
+        g.DrawArc(i < active ? lit : unlit, -192, -192, 384, 384, 135 + 270f * i / segments, 3.9f);
+      for (int i = 0; i <= 18; i++) {
+        double angle = (135 + i * 15) * Math.PI / 180;
+        int inner = i % 3 == 0 ? 150 : 158;
+        g.DrawLine(tick, (float)Math.Cos(angle) * inner, (float)Math.Sin(angle) * inner,
+                   (float)Math.Cos(angle) * 168, (float)Math.Sin(angle) * 168);
+      }
+    }
+    var fan = g.Save();
+    g.TranslateTransform(0, -64);
+    PaintFan(g, 1.9f);
+    g.Restore(fan);
+    using (var centered = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+    using (var valueFont = new Font("Bahnschrift", 74, GraphicsUnit.Pixel))
+    using (var unitFont = new Font("Segoe UI Semibold", 20, GraphicsUnit.Pixel)) {
+      g.DrawString(rpm < 0 ? "—" : rpm.ToString("N0"), valueFont, Brushes.White, new PointF(0, 12), centered);
+      g.DrawString("R P M", unitFont, Brushes.Silver, new PointF(0, 66), centered);
+    }
+    g.Restore(state);
+  }
+}
+
+static TableLayoutPanel GraphiteGrid(int columns) {
   TableLayoutPanel panel = new TableLayoutPanel {
     AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = columns,
     Margin = Padding.Empty, GrowStyle = TableLayoutPanelGrowStyle.AddRows
@@ -1555,7 +1705,7 @@ static TableLayoutPanel SlateGrid(int columns) {
   return panel;
 }
 
-static void SlateAdd(TableLayoutPanel grid, Control control, int column = 0, int row = -1) {
+static void GraphiteAdd(TableLayoutPanel grid, Control control, int column = 0, int row = -1) {
   if (row < 0) {
     row = grid.RowCount++;
     grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -1565,15 +1715,15 @@ static void SlateAdd(TableLayoutPanel grid, Control control, int column = 0, int
   grid.Controls.Add(control, column, row);
 }
 
-static TableLayoutPanel SlateCard(string title) {
-  TableLayoutPanel card = SlateGrid(1);
-  card.BackColor = SlatePanel;
+static TableLayoutPanel GraphiteCard(string title) {
+  TableLayoutPanel card = GraphiteGrid(1);
+  card.BackColor = GraphitePanel;
   card.Padding = new Padding(11, 8, 11, 3);
-  SlateAdd(card, SlateText(title, 13, Color.White));
+  GraphiteAdd(card, GraphiteText(title, 13, Color.White));
   return card;
 }
 
-static Label SlateText(string text, float size, Color color) {
+static Label GraphiteText(string text, float size, Color color) {
   return new Label {
     AutoSize = true, Margin = Padding.Empty, Text = text,
     Font = new Font("Segoe UI Semibold", size), ForeColor = color
@@ -1581,60 +1731,100 @@ static Label SlateText(string text, float size, Color color) {
 }
 
 static Label AddTemperature(TableLayoutPanel parent, string name, int column) {
-  TableLayoutPanel group = SlateGrid(1);
-  SlateAdd(group, SlateText(name, 9, Color.LightSteelBlue));
-  Label value = SlateText("--", 21, Color.White);
+  TableLayoutPanel group = GraphiteGrid(2);
+  group.Margin = new Padding(5);
+  group.Padding = new Padding(10, 6, 10, 5);
+  group.BackColor = GraphitePanel;
+  Label title = GraphiteText(name, 12, Color.Silver);
+  title.TextAlign = ContentAlignment.MiddleLeft;
+  GraphiteAdd(group, title, 0, 0);
+  Label value = GraphiteText("--", 22, GraphiteAccent);
   value.AccessibleName = name + " temperature";
-  SlateAdd(group, value);
-  SlateAdd(parent, group, column, 0);
+  value.TextAlign = ContentAlignment.MiddleRight;
+  GraphiteAdd(group, value, 1, 0);
+  GraphiteAdd(parent, group, column, 0);
+  group.Dock = DockStyle.Fill;
+  title.Dock = value.Dock = DockStyle.Fill;
   return value;
 }
 
-static Button SlateButton(string text) {
+static Button GraphiteButton(string text) {
   Button button = new Button {
     Height = 34, Margin = Padding.Empty, Text = text, FlatStyle = FlatStyle.Flat,
-    BackColor = SlatePanel, ForeColor = Color.White, Cursor = Cursors.Hand,
+    BackColor = GraphitePanel, ForeColor = Color.White, Cursor = Cursors.Hand,
     UseVisualStyleBackColor = false
   };
-  button.FlatAppearance.BorderColor = SlateBorder;
+  button.FlatAppearance.BorderColor = GraphiteBorder;
   return button;
 }
 
+sealed class InstrumentSlider : TrackBar {
+  public InstrumentSlider() {
+    SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+  }
+
+  protected override void OnValueChanged(EventArgs e) {
+    base.OnValueChanged(e);
+    Invalidate();
+  }
+
+  protected override void OnPaint(PaintEventArgs e) {
+    base.OnPaint(e);
+    e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+    const int left = 12;
+    int width = Math.Max(0, ClientSize.Width - left * 2);
+    int y = ClientSize.Height / 2;
+    float thumb = left + width * (Value - Minimum) / (float)(Maximum - Minimum);
+    using (Pen rail = new Pen(GraphiteBorder, 5))
+    using (Pen progress = new Pen(GraphiteAccent, 5))
+    using (Brush fill = new SolidBrush(GraphiteAccent)) {
+      rail.StartCap = rail.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+      progress.StartCap = progress.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+      e.Graphics.DrawLine(rail, left, y, left + width, y);
+      e.Graphics.DrawLine(progress, left, y, thumb, y);
+      e.Graphics.FillEllipse(fill, thumb - 7, y - 7, 14, 14);
+      e.Graphics.DrawEllipse(Pens.White, thumb - 7, y - 7, 14, 14);
+    }
+    if (Focused && ShowFocusCues) ControlPaint.DrawFocusRectangle(e.Graphics, ClientRectangle);
+  }
+}
+
 static TrackBar AddSlider(TableLayoutPanel grid, string name, int min, int max, out Label value, EventHandler changed) {
-  TableLayoutPanel heading = SlateGrid(2);
+  TableLayoutPanel heading = GraphiteGrid(2);
   heading.ColumnStyles.Clear();
   heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 57));
   heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 43));
-  SlateAdd(heading, SlateText(name, 10, Color.White), 0, 0);
-  value = SlateText("", 10, SlateAccent);
+  GraphiteAdd(heading, GraphiteText(name, 10, Color.White), 0, 0);
+  value = GraphiteText("", 10, GraphiteAccent);
   value.TextAlign = ContentAlignment.MiddleRight;
-  SlateAdd(heading, value, 1, 0);
-  SlateAdd(grid, heading);
-  TrackBar slider = new TrackBar {
+  GraphiteAdd(heading, value, 1, 0);
+  GraphiteAdd(grid, heading);
+  TrackBar slider = new InstrumentSlider {
     Minimum = min, Maximum = max, Value = min, SmallChange = 1, LargeChange = 5,
     TickStyle = TickStyle.None, AutoSize = false, Height = 25,
-    Margin = Padding.Empty, BackColor = SlatePanel, AccessibleName = name
+    Margin = Padding.Empty, BackColor = GraphiteBackground, AccessibleName = name
   };
   slider.ValueChanged += changed;
-  SlateAdd(grid, slider);
+  GraphiteAdd(grid, slider);
   return slider;
 }
 
 static CheckBox AddCheck(TableLayoutPanel grid, string text) {
   CheckBox check = new CheckBox { Text = text, AutoSize = true, Margin = Padding.Empty };
-  SlateAdd(grid, check);
+  GraphiteAdd(grid, check);
   return check;
 }
 
 static void AddDisclosure(TableLayoutPanel parent, string title, Panel options) {
-  Button button = SlateButton("+  " + title);
+  Button button = GraphiteButton(title + "    ▾");
+  button.Height = 48;
   button.TextAlign = ContentAlignment.MiddleLeft;
   button.Click += delegate {
     options.Visible = !options.Visible;
-    button.Text = (options.Visible ? "−  " : "+  ") + title;
+    button.Text = title + (options.Visible ? "    ▴" : "    ▾");
   };
-  SlateAdd(parent, button);
-  SlateAdd(parent, options);
+  GraphiteAdd(parent, button);
+  GraphiteAdd(parent, options);
 }
 static Color ParseHex(string hex) {
   try {
@@ -1685,7 +1875,7 @@ static void SmoothChanged(object s, EventArgs e) {
 static void LayoutColors() {
   foreach (var swatch in colorSwatches) {
     bool selected = led == "static" && string.Equals(ledColor, swatch.Key, StringComparison.OrdinalIgnoreCase);
-    swatch.Value.FlatAppearance.BorderColor = selected ? Color.White : SlateBorder;
+    swatch.Value.FlatAppearance.BorderColor = selected ? Color.White : GraphiteBorder;
     swatch.Value.FlatAppearance.BorderSize = selected ? 3 : 1;
   }
 }
@@ -1696,8 +1886,9 @@ static void SyncDash() {
     foreach (Button button in profBtns) {
       bool selected = manual ? button.Text == "Manual" :
         string.Equals(prof, button.Text, StringComparison.OrdinalIgnoreCase);
-      button.BackColor = selected ? Color.FromArgb(29, 73, 103) : SlatePanel;
-      button.FlatAppearance.BorderColor = selected ? SlateAccent : SlateBorder;
+      button.BackColor = selected ? Color.FromArgb(47, 67, 19) : GraphitePanel;
+      button.FlatAppearance.BorderColor = selected ? GraphiteAccent : GraphiteBorder;
+      button.ForeColor = selected ? GraphiteAccent : Color.White;
       button.AccessibleDescription = selected ? "Selected fan profile" : "";
     }
     bool automatic = !manual && prof != "turbo";
@@ -1776,10 +1967,10 @@ static void DashTick(object sender, EventArgs e) {
   int cpu = curCpu, gpu = curGpu, rpm = curRpm;
   lblCpu.Text = cpu < 0 ? "--" : cpu + " °C";
   lblGpu.Text = gpu < 0 ? "--" : gpu + " °C";
-  lblFan.Text = rpm < 0 ? "-- RPM" : rpm.ToString("N0") + " RPM";
+  speedMeter.AccessibleDescription = rpm < 0 ? "Speed unavailable" : rpm.ToString("N0") + " RPM";
   speedMeter.Invalidate();
   bool connected = devH != new IntPtr(-1);
-  lblHead.Text = connected ? "USB connected  ·  Commanded speed" : "USB disconnected";
+  lblHead.Text = connected ? "USB connected" : "USB disconnected";
   int now = Environment.TickCount, deadline = Volatile.Read(ref manualTurboUntil);
   int seconds = NotExpired(now, deadline) ? (unchecked(deadline - now) + 999) / 1000 : 0;
   btnTurbo.Enabled = !paused && connected;
