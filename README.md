@@ -1,5 +1,11 @@
 # Razer Laptop Cooling Pad - open-source controller + dashboard (RTX Spark / ARM64)
 
+## Launch on Windows
+
+Double-click [Start-RazerPad.cmd](Start-RazerPad.cmd). It builds the app on first launch.
+If an older RazerPad tray app is running, exit it from its tray menu first. To reopen
+the dashboard, right-click the RazerPad icon by the Windows clock and select **Open dashboard**.
+
 Razer Synapse cannot drive the Razer Laptop Cooling Pad on this machine, because it does
 not support the NVIDIA RTX Spark (GB10 / ARM64) host for the automatic fan page: it cannot
 read the hardware temperature, so the pad just sits in its onboard default.
@@ -9,14 +15,14 @@ adds a **system-tray app** that controls the fan and the 18-LED light bar from h
 temperatures. It runs side by side with Synapse (no admin required).
 
 * Device: USB `VID 1532 / PID 0F43`, control interface **MI_00**, 91-byte HID feature report
-* Real device commands verified on hardware - see `PROTOCOL.md`
+* Real device commands verified on hardware - see [the protocol notes](docs/PROTOCOL.md)
 * Prior art that helped: `github.com/Benson5650/FanControl.RazerCoolingPadPlugin`, `github.com/morluto/rea`
 
 ---
 
 ## 1. The tray app (this is what runs)
 
-`RazerPadTray.exe` lives in the notification area. Its icon is a coloured disc that shows the
+`bin/RazerPadFan.exe` lives in the notification area. Its icon is a coloured disc that shows the
 current temperature (green when cool, red when hot) and the tooltip shows live CPU / GPU / fan RPM.
 
 Everything is configured by clicking the tray icon:
@@ -72,48 +78,32 @@ instead of fighting the first one for the device.
 ## 2. Build from source
 
 ```
-git clone https://github.com/YOURNAME/RazerCoolingPad-Control.git
-cd RazerCoolingPad-Control
-build.cmd            ''-> produces RazerPadFan.exe (no Visual Studio needed; uses the Windows-bundled csc)
-RazerPadFan.exe      ''starts the tray app and pops the dashboard
+git clone https://github.com/Jasonz09/RazerPad-Control.git
+cd RazerPad-Control
+Start-RazerPad.cmd
 ```
 
-Runtime: Windows 10/11 (any architecture - it is pure .NET Framework 4.x), and the pad plugged
-in over USB. No admin rights required. The C# source is a single file (`src\RazerPadFan.cs`).
+Windows 10/11 and the .NET Framework C# compiler are required. Connect the pad over USB.
 
-## 3. Files on disk
+## 3. Project layout
 
-```
-C:\Users\zhaoF\RazerPadFan\
-  RazerPadTray.exe     the tray app (this is what you run)
-  RazerPadTray.cs      its source
-  tray.cfg             your saved settings (written by the tray menu; live-edited OK)
-  status.txt           live status, updated every loop
-  crash.log            error / hot-reload log (auto-trimmed)
-  Start-RazerPad.cmd   start the tray if it is not already running
-  Stop-RazerPad.cmd    stop it
-  autostart.cfg        settings for the OLD command-line controller (unused by the tray)
-  RazerPadFan.exe/.cs  the original CLI controller, kept as a fallback / reference
-  PROTOCOL.md          the reverse-engineered wire protocol
-```
+| Location | Purpose |
+|---|---|
+| `Start-RazerPad.cmd` | Launcher |
+| `build.cmd` | Rebuild from source |
+| `src/` | Dashboard and controller source |
+| `docs/` | USB protocol notes |
+| `bin/` | Local executable, settings, status, and logs |
 
 ## 4. Autostart
 
-`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\RazerPadFan.vbs` launches the tray
-hidden at every logon:
-
-```vbs
-Set sh = CreateObject("WScript.Shell")
-sh.CurrentDirectory = "C:\Users\zhaoF\RazerPadFan"
-sh.Run """C:\Users\zhaoF\RazerPadFan\RazerPadTray.exe"" --interval 2000 --status-file ""C:\Users\zhaoF\RazerPadFan\status.txt""", 0, False
-```
-
-To disable: delete that `.vbs` (or Shift-right-click the tray icon and Exit).
+Open **Device options** and enable **Start with Windows**. If it was enabled from
+an older copy, toggle it off and back on here to update the launch path.
 
 ## 5. Command-line flags (all optional; they override `tray.cfg`)
 
 ```
-RazerPadTray.exe [flags]
+bin/RazerPadFan.exe [flags]
 
   --profile NAME        quiet | balanced | performance | turbo
   --led MODE            heatmap | level | wave | spectrum | breath | rainbow | static | off
@@ -140,7 +130,7 @@ RazerPadTray.exe [flags]
 Example - read the pad without touching it:
 
 ```
-C:\Users\zhaoF\RazerPadFan\RazerPadTray.exe --status
+bin/RazerPadFan.exe --status
 CPU=32.6C GPU=47C fanUnit=24 (~1200rpm)
 ```
 
@@ -157,16 +147,8 @@ CPU=32.6C GPU=47C fanUnit=24 (~1200rpm)
 
 ## 7. Rebuild
 
-Only the .NET Framework 4.x compiler is needed (ships with Windows, works on ARM64):
-
-```
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:exe ^
-  /out:RazerPadTray.exe /reference:System.dll ^
-  /reference:System.Windows.Forms.dll /reference:System.Drawing.dll RazerPadTray.cs
-```
-
-Compile to a **new file name** and copy it over `RazerPadTray.exe` after stopping the running
-instance - a live process locks its own exe.
+Exit the tray app and run `build.cmd` to rebuild `bin/RazerPadFan.exe`.
+Open it with `Start-RazerPad.cmd`.
 
 ## 8. Version history
 
@@ -244,7 +226,7 @@ instance - a live process locks its own exe.
   - Per-user **Start with Windows** via the `HKCU\...\Run` key (no admin, replaces the old Startup `.vbs`).
 ### crash.log
 
-If something unexpected happens, look at `C:\Users\zhaoF\RazerPadFan\crash.log`.
+If something unexpected happens, look at `bin/crash.log`.
 Every hot-reload is recorded there too, so you can confirm config edits landed.
 
 ---
