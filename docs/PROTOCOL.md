@@ -7,9 +7,10 @@ this protocol "rzDevice25". Source: extracted from Razer Synapse middleware JS
 
 ## 91-byte feature report layout (wire; byte 0 = report ID 0x00)
   [0]     reportId 0x00
-  [2]     transactionId (0..31, auto-increment; reply echoes it)
-  [6]     payload total length = 3 + payloadLen
-  [7]     classId   (13 = THERMAL, 3 = LED)
+  [1]     status (0x00 in a request, 0x02 for a successful lighting reply)
+  [2]     transactionId (reply echoes it)
+  [6]     data length (depends on the command class)
+  [7]     classId (0x0D thermal, 0x0F Chroma extended matrix)
   [8]     commandId
   [9..]   payload data
   [89]    checksum = XOR of bytes [3..88]
@@ -37,17 +38,25 @@ Real physical range: raw 10 (=500 RPM) .. raw 64 (=3200 RPM).
  impossible. The correct ceiling is 64 = 3200 RPM. Confirmed live: GetFanInfo ladder tops
  at 0x40=64, and a Set of 64 is echoed/accepted.)
 
-## LED class (classId 3)  -  18-LED light bar
-  0x01 SET_RGB       req: 03 <id> <r> <g> <b>
-  0x03 SET_BRIGHT    req: 03 <id> <bri0..100>
-  0x0B SET_MATRIX   req: [<effect>, params...]   (NO leading class byte; starts at payload[0])
-  Effects (matrix byte 0): 0=OFF 1=WAVE 2=AFTERGLOW 3=BREATH 4=SPECTRUM 5=CUSTOMFRAME 6=STATIC
-    Static     = [6, r, g, b]
-    Breathing  = [3, 1, r, g, b]
-    Spectrum   = [4]
-    Off        = [0]
-    CustomFrame= [5, R0,G0,B0 ... R17,G17,B17]  (len 55, per-LED RGB - used for heatmap)
-  All 18 LEDs are addressed as one matrix for the effect modes.
+## Chroma extended matrix (class 0x0F)
+
+Use transaction ID `0x1F`. The data length is the number of argument bytes.
+
+| Command | Arguments |
+| --- | --- |
+| `0x03` (frame) | `00 00 00 00 11` followed by 18 RGB triples |
+| `0x02` (activate custom frame) | `00 00 08` followed by nine zero bytes |
+| `0x02` (lighting off) | `01 00 00 00 00 00` |
+| `0x04` (master brightness) | `01 00 <0–255>` |
+| `0x84` (read master brightness) | `01 00 00`. The reply returns the value in its third argument. |
+
+The pad echoed the arguments and reported status `0x02` for these commands.
+The previous class 3 matrix requests returned `0x05` (unsupported) on this pad.
+The app sets master brightness to 255 on connection and applies the effective
+brightness to the RGB values it sends. Live previews use the acknowledged frame.
+The custom editor draws its draft separately.
+
+[OpenRazer cooling pad support and packet builders](https://github.com/openrazer/openrazer/pull/2798/files)
 
 ## RazerPadFan v2 behaviour
 - Fan curve = list of {temperature, RPM} points, linear interpolation; below the first
@@ -76,16 +85,13 @@ counter (CPU).
 Also 91-byte reports, reportId 0, checksum, factor 50. He uses a simplified curve control
 (class13 cmd 0x10, fixed payload, one-byte shortcut checksum RPM_lo^0x0B) and correctly
 assumes the 500-3200 RPM range. This tool uses the actual Synapse commands (0x01/0x81/
-0x82/0x04/0x83) with the full XOR checksum, plus the LED class (3) that his plugin does not
-drive. Reference for the LED/matrix command shapes: Razer rzDevice25 middleware + morluto/rea.
+0x82/0x04/0x83) with the full XOR checksum. Lighting uses the Chroma protocol above.
 ---
 
 ## Note (v4/v5 client architecture)
 
-The wire protocol above is unchanged, but the client now uses three threads
-(fan worker / GPU sampler / LED animator). All HID feature-report calls
-(SetFeature/GetFeature on the shared device handle) are serialised behind a
-single process-wide lock. LED animation frames use fire-and-forget
-SetFeature with no matching GetFeature read - measured ~1 ms per 91-byte
-frame (~1000 fps possible), which is what makes smooth 25 fps effects safe.
-Fan speed/mode reads still verify the reply (classId/cmd echo).
+The fan worker and LED animator serialize HID transactions behind a single
+process-wide lock. Lighting verifies the status, transaction, command, payload
+and checksum before publishing a frame to the preview. Still frames refresh
+periodically. Fan speed and mode reads continue to check the reply class and
+command.

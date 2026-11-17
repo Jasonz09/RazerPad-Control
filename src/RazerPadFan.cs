@@ -9,8 +9,9 @@ using System.Threading;
 using System.Text;
 using System.Windows.Forms;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 namespace RazerPadFan {
-internal static class Program {
+internal static partial class Program {
 const int VID = 0x1532, PID = 0x0F43;
 const int WIRE = 91;
 const byte REPORT_ID = 0x00;
@@ -123,20 +124,26 @@ if (result != null) break;
 } finally { SetupDiDestroyDeviceInfoList(set); }
 return result;
 }
-static bool Transact(IntPtr h, byte classId, byte cmd, byte[] payload, int forcedLen, int waitMs, out byte[] reply) {
+static byte[] FeatureReport(byte classId, byte cmd, byte[] payload, int forcedLen, byte transactionId) {
   byte[] wire = new byte[WIRE];
   int plen = payload == null ? 0 : payload.Length;
   int len = (forcedLen > 0) ? forcedLen : 3 + plen;
-  byte tid = (byte)NextTid();
   wire[0] = REPORT_ID;
-  wire[2] = tid;
+  wire[2] = transactionId;
   wire[6] = (byte)len;
   wire[7] = classId;
   wire[8] = cmd;
   if (payload != null) for (int i = 0; i < plen; i++) wire[9 + i] = payload[i];
-  byte cs = 0;
-  for (int n = 3; n < 89; n++) cs ^= wire[n];
-  wire[89] = cs;
+  wire[89] = ReportChecksum(wire);
+  return wire;
+}
+static byte ReportChecksum(byte[] wire) {
+  byte checksum = 0;
+  for (int n = 3; n < 89; n++) checksum ^= wire[n];
+  return checksum;
+}
+static bool Transact(IntPtr h, byte classId, byte cmd, byte[] payload, int forcedLen, int waitMs, out byte[] reply) {
+  byte[] wire = FeatureReport(classId, cmd, payload, forcedLen, (byte)NextTid());
   if (!HidD_SetFeature(h, wire, WIRE)) { reply = null; return false; }
   if (waitMs > 0) Thread.Sleep(waitMs);
   for (int i = 0; i < WIRE; i++) wire[i] = 0;
@@ -171,21 +178,53 @@ static bool TxLenC(IntPtr h, byte classId, byte cmd, byte[] payload, int forcedL
   for (int a = 0; a < waits.Length; a++)
     if (Transact(h, classId, cmd, payload, forcedLen, waits[a], out reply)) return true;
   reply = null; return false;
-}// Fast fire-and-forget write: a single SetFeature + one read flush, NO retry loop and NO
-// sleep. Measured at ~1ms/frame, this is what unlocks smooth ~25-30fps animation. Returns
-// success but callers (animation) may ignore it - a dropped frame is harmless.
-static bool FastWrite(IntPtr h, byte classId, byte cmd, byte[] payload, int forcedLen) {
-  byte[] reply;
-  try { return Transact(h, classId, cmd, payload, forcedLen, 0, out reply); }
-  catch { reply = null; return false; }
 }
-static void MatrixCustomFast(IntPtr h, byte[] rgb18) {
-  byte[] p = new byte[1 + NUM_LED * 3]; p[0] = UE_CUSTOMFRAME;
-  for (int i = 0; i < NUM_LED * 3; i++) p[1 + i] = rgb18[i];
-  lock (hidLock) { FastWrite(h, CLASS_LED, LED_SET_MATRIX, p, 3 + p.Length); }
+
+// RC21-0230 uses Chroma extended matrix with the zero LED and a one-row, 18-pixel strip.
+const byte ChromaClass = 0x0F, ChromaTransaction = 0x1F, ChromaOk = 0x02;
+const byte ChromaEffect = 0x02, ChromaFrame = 0x03, ChromaBrightness = 0x04;
+static readonly byte[] ChromaOff = { 1, 0, 0, 0, 0, 0 };
+static readonly byte[] ChromaCustom = { 0, 0, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static bool lightBarBrightnessReady;
+static int lightBarModeAt;
+
+// Called with hidLock held, so a thermal transaction cannot replace the Chroma reply.
+static bool WriteChroma(IntPtr h, byte command, byte[] payload) {
+  byte[] wire = FeatureReport(ChromaClass, command, payload, payload.Length, ChromaTransaction);
+  if (!HidD_SetFeature(h, wire, WIRE)) return false;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) Thread.Sleep(6);
+    Array.Clear(wire, 0, wire.Length);
+    if (!HidD_GetFeature(h, wire, WIRE) || !IsChromaReply(wire, command, payload)) continue;
+    if (wire[1] == ChromaOk) return true;
+    if (wire[1] != 0x01) return false;
+  }
+  return false;
 }
-static void MatrixOffFast(IntPtr h) { lock (hidLock) { FastWrite(h, CLASS_LED, LED_SET_MATRIX, new byte[] { UE_OFF }, 3 + 1); } }
-static void MatrixStaticFast(IntPtr h, int r, int g, int b) { lock (hidLock) { FastWrite(h, CLASS_LED, LED_SET_MATRIX, new byte[] { UE_STATIC, (byte)r, (byte)g, (byte)b }, 3 + 4); } }
+
+static bool IsChromaReply(byte[] wire, byte command, byte[] payload) {
+  return wire[0] == REPORT_ID && wire[2] == ChromaTransaction && wire[6] == payload.Length &&
+    wire[7] == ChromaClass && wire[8] == command && ReportChecksum(wire) == wire[89] &&
+    payload.SequenceEqual(wire.Skip(9).Take(payload.Length));
+}
+
+static byte[] ChromaRow(byte[] frame) {
+  var row = new byte[5 + NUM_LED * 3];
+  row[4] = NUM_LED - 1;
+  frame.CopyTo(row, 5);
+  return row;
+}
+
+static bool TrySendLightBar(IntPtr h, byte[] frame, bool off, bool refreshMode) {
+  if (off) return WriteChroma(h, ChromaEffect, ChromaOff);
+  // Brightness is already baked into each pixel, so hold the device's master multiplier at full.
+  if (!lightBarBrightnessReady) {
+    lightBarBrightnessReady = WriteChroma(h, ChromaBrightness, new byte[] { 1, 0, 255 });
+    if (!lightBarBrightnessReady) return false;
+  }
+  if (!WriteChroma(h, ChromaFrame, ChromaRow(frame))) return false;
+  return !refreshMode || WriteChroma(h, ChromaEffect, ChromaCustom);
+}
 static byte Bake(int v, int bri) { if (v < 0) v = 0; if (v > 255) v = 255; if (bri < 0) bri = 0; if (bri > 100) bri = 100; return (byte)(v * bri / 100); }static int[] GetIdList(IntPtr h) {
   byte[] r;
   if (!Tx(h, CMD_GET_IDLIST, new byte[0], out r) || r.Length < 2) return null;
@@ -386,6 +425,9 @@ static void CfgChanged(object s, FileSystemEventArgs e) {
     if (now - lastCfgReloadMs < 400) return;
     lastCfgReloadMs = now;
     LoadConfig();
+    Form current = dash;
+    if (current != null && current.IsHandleCreated && !current.IsDisposed)
+      current.BeginInvoke((Action)SyncDash);
     LogCrash("hot-reload: led=" + led + " profile=" + prof + " bri=" + bri);
   } catch { }
 }
@@ -450,15 +492,14 @@ static int coast = 15;                  // anti-hunt: seconds the fan waits befo
 static Form dash;                      // the dashboard window (null = not open)
 static bool exiting = false;           // set when the user truly exits (so closing the window quits)
 static System.Windows.Forms.Timer dashTimer;   // ~500ms live-refresh for the open window
-static Label lblCpu, lblGpu, lblHead;   // live read-outs
+static Label lblCpu, lblGpu, lblHead, lblRpm;   // live read-outs
 static TrackBar tbFan, tbBri;          // manual fan speed + LED brightness
 static Label lblFanVal, lblBriVal;     // slider value captions
-static ComboBox cbLed;                 // lighting effect selector
+static Panel lightingPreview;
 static CheckBox ckAutoTurbo, ckLoadBoost, ckWearCap, ckSteady, ckCoolTail, ckIdleDim, ckNightDim, ckHyper; // option toggles
-static Button btnTurbo, btnPause;  // action buttons
+static RoundedButton btnTurbo, btnPause;
 static bool dashSyncing = false;       // guard: suppress slider/toggle events while refreshing the UI
-static List<Button> profBtns = new List<Button>();    // profile quick-select buttons
-static Dictionary<string, Button> colorSwatches = new Dictionary<string, Button>();
+static List<RoundedButton> profBtns = new List<RoundedButton>();
 static TrackBar tbSmooth;              // fan steadiness: how hard the controller resists speed changes
 static Label lblSmoothVal;
 static CheckBox ckAutoStart;           // start the controller when Windows starts
@@ -513,6 +554,9 @@ static List<CP> ProfileCurve(string p, out int fixedU, out int rMin, out int rMa
 
 static bool Reopen() {
   lock (hidLock) {
+    lightingOutput = null;
+    lightingConnection++;
+    lightBarBrightnessReady = false;
     try { if (devH != new IntPtr(-1)) { CloseHandle(devH); devH = new IntPtr(-1); } } catch { }
   }
   string path = FindDevicePath();
@@ -556,16 +600,16 @@ static void LedLevel(IntPtr h, double temp) {
   }
   MatrixCustom(h, rgb);
 }
-static void LedRainbowFast(IntPtr h, double ph, int bri) {
+static byte[] RainbowFrame(double ph, int bri, bool uniform) {
   byte[] rgb = new byte[NUM_LED * 3];
   for (int i = 0; i < NUM_LED; i++) {
-    int hu = (int)(ph + i * (360.0 / NUM_LED)) % 360;
+    int hu = (int)(ph + (uniform ? 0 : i * (360.0 / NUM_LED))) % 360;
     int r, g, b; HSV(hu, 100, 100, out r, out g, out b);
     rgb[i * 3] = Bake(r, bri); rgb[i * 3 + 1] = Bake(g, bri); rgb[i * 3 + 2] = Bake(b, bri);
   }
-  MatrixCustomFast(h, rgb);
+  return rgb;
 }
-static void LedWaveFast(IntPtr h, double ph, double temp, int bri) {
+static byte[] WaveFrame(double ph, double temp, int bri) {
   int baseH = TempHue(temp);
   byte[] rgb = new byte[NUM_LED * 3];
   for (int i = 0; i < NUM_LED; i++) {
@@ -575,9 +619,9 @@ static void LedWaveFast(IntPtr h, double ph, double temp, int bri) {
     int r, g, b; HSV(hu, 100, (int)vv, out r, out g, out b);
     rgb[i * 3] = Bake(r, bri); rgb[i * 3 + 1] = Bake(g, bri); rgb[i * 3 + 2] = Bake(b, bri);
   }
-  MatrixCustomFast(h, rgb);
+  return rgb;
 }
-static void LedLevelFast(IntPtr h, double temp, int bri) {
+static byte[] LevelFrame(double temp, int bri) {
   double f = (temp - 30.0) / 70.0; if (f < 0) f = 0; if (f > 1) f = 1;
   int lit = (int)Math.Round(f * NUM_LED); if (lit < 1) lit = 1; if (lit > NUM_LED) lit = NUM_LED;
   int hue = TempHue(temp);
@@ -587,9 +631,9 @@ static void LedLevelFast(IntPtr h, double temp, int bri) {
     if (i < lit) HSV(hue, 100, 100, out r, out g, out b); else HSV(hue, 100, 12, out r, out g, out b);
     rgb[i * 3] = Bake(r, bri); rgb[i * 3 + 1] = Bake(g, bri); rgb[i * 3 + 2] = Bake(b, bri);
   }
-  MatrixCustomFast(h, rgb);
+  return rgb;
 }
-static void LedHeatmapFast(IntPtr h, double temp, int bri) {
+static byte[] HeatmapFrame(double temp, int bri) {
   int baseH = TempHue(temp);
   byte[] rgb = new byte[NUM_LED * 3];
   for (int i = 0; i < NUM_LED; i++) {
@@ -597,9 +641,9 @@ static void LedHeatmapFast(IntPtr h, double temp, int bri) {
     int r, g, b; HSV(hu, 100, 100, out r, out g, out b);
     rgb[i * 3] = Bake(r, bri); rgb[i * 3 + 1] = Bake(g, bri); rgb[i * 3 + 2] = Bake(b, bri);
   }
-  MatrixCustomFast(h, rgb);
+  return rgb;
 }
-static void LedBreathFast(IntPtr h, double ph, double temp, byte cr, byte cg, byte cb, int bri) {
+static byte[] BreathFrame(double ph, double temp, byte cr, byte cg, byte cb, int bri) {
   double period = 3200.0 - 20.0 * temp; if (period < 900) period = 900; if (period > 3200) period = 3200;
   double cyc = (ph / period) * (2 * Math.PI);
   double env = 0.15 + 0.85 * (0.5 - 0.5 * Math.Cos(cyc));
@@ -607,9 +651,9 @@ static void LedBreathFast(IntPtr h, double ph, double temp, byte cr, byte cg, by
   for (int i = 0; i < NUM_LED; i++) {
     rgb[i * 3] = Bake((int)(cr * env), bri); rgb[i * 3 + 1] = Bake((int)(cg * env), bri); rgb[i * 3 + 2] = Bake((int)(cb * env), bri);
   }
-  MatrixCustomFast(h, rgb);
+  return rgb;
 }
-static void LedLoadMeter(IntPtr h, double cload, double gload, double temp, int bri) {
+static byte[] LoadMeterFrame(double cload, double gload, double temp, int bri) {
   if (cload < 0) cload = 0; if (cload > 100) cload = 100;
   if (gload < 0) gload = 0; if (gload > 100) gload = 100;
   int hue = TempHue(temp);
@@ -623,67 +667,174 @@ static void LedLoadMeter(IntPtr h, double cload, double gload, double temp, int 
     if (seg < litSeg) HSV(hue, 100, 100, out r, out g, out b); else HSV(hue, 100, 12, out r, out g, out b);
     rgb[i * 3] = Bake(r, bri); rgb[i * 3 + 1] = Bake(g, bri); rgb[i * 3 + 2] = Bake(b, bri);
   }
-  MatrixCustomFast(h, rgb);
+  return rgb;
 }
-static void LedLoop() {
-  int frameMs = 40;
-  int lastStaticMs = -999999;
-  int ledPhase = 0; double ledPhaseF = 0;
-  string drawnSig = "";
-  Stopwatch sw = Stopwatch.StartNew();
-  int lastMs = 0;
-  while (_run) {
-    IntPtr h = devH;
-    if (h == new IntPtr(-1)) { lastStaticMs = -999999; drawnSig = ""; Thread.Sleep(200); continue; }
-    int now = (int)sw.ElapsedMilliseconds;
-    string ml, mc; int mb; bool pz; bool idl, nd;
-    lock (cfgLock) { ml = led; mc = ledColor; mb = bri; pz = paused; idl = idleDim; nd = nightDim; }
-    double use = Math.Max(curCpu, curGpu);
-    bool crit = (critical > 0 && use >= critical && !paused);
-    int effBri = mb;
-    if (idl && use >= 0 && use < 45 && !crit) { if (effBri > IDLE_BRI) effBri = IDLE_BRI; }
-    if (nd) { int hr = DateTime.Now.Hour; if (hr >= 22 || hr < 7) { if (effBri > NIGHT_BRI) effBri = NIGHT_BRI; } }
-    bool animate = (ml == "rainbow" || ml == "wave" || ml == "level" || ml == "heatmap" || ml == "temp" || ml == "loadmeter" || ml == "breath" || ml == "breathing");
-    try {
-      if (paused || ml == "off" || ml == "none") {
-        if (drawnSig != "off" && now - lastStaticMs >= 200) { MatrixOffFast(h); drawnSig = "off"; lastStaticMs = now; }
-      } else if (crit) {
-        bool on = ((now / 350) % 2) == 0;
-        string cs = "crit" + (on ? "1" : "0");
-        if (drawnSig != cs && now - lastStaticMs >= 300) {
-          if (on) MatrixStaticFast(h, Bake(255, effBri), 0, 0); else MatrixOffFast(h);
-          drawnSig = cs; lastStaticMs = now;
-        }
-      } else if (ml == "static") {
-        byte[] cc = HexTo3(ColorName(mc)); if (cc == null) cc = new byte[] { 255, 255, 255 };
-        string sig = "static|" + effBri;
-        if (drawnSig != sig) { MatrixStaticFast(h, Bake(cc[0], effBri), Bake(cc[1], effBri), Bake(cc[2], effBri)); drawnSig = sig; lastStaticMs = now; }
-      } else if (ml == "spectrum") {
-        string sig = "spectrum|" + effBri;
-        if (drawnSig != sig) { lock (hidLock) { SetLedAllBrightness(h, 255); MatrixSpectrum(h); } drawnSig = sig; lastStaticMs = now; }
-      } else {
-        string sig = ml + "|" + mc + "|" + effBri;
-        if (sig != drawnSig) { drawnSig = sig; ledPhase = 0; ledPhaseF = 0; }
-        double dt = now - lastMs; lastMs = now; ledPhaseF += dt;
-        if (ml == "rainbow") LedRainbowFast(h, (ledPhaseF / 16.0) % 360.0, effBri);
-        else if (ml == "wave") LedWaveFast(h, (ledPhaseF / 16.0) % 360.0, use, effBri);
-        else if (ml == "level") LedLevelFast(h, use, effBri);
-        else if (ml == "loadmeter") LedLoadMeter(h, cpuLoad, gpuLoad, use, effBri);
-        else if (ml == "breath" || ml == "breathing") {
-          byte[] cc = HexTo3(ColorName(mc)); if (cc == null) { string cn2 = ColorName(ledColor); cc = HexTo3(cn2); }
-          if (cc == null) cc = new byte[] { 255, 0, 0 };
-          LedBreathFast(h, ledPhaseF, use, cc[0], cc[1], cc[2], effBri);
-        } else LedHeatmapFast(h, use, effBri);
-        lastStaticMs = now;
-      }
-    } catch { }
-    bool anim2 = animate && !paused;
-    int nap = anim2 ? frameMs : 250;
-    int sleepMs = nap - ((int)sw.ElapsedMilliseconds - now);
-    if (sleepMs < 1) sleepMs = 1;
-    while (sleepMs > 0 && _run) { int step = sleepMs > 50 ? 50 : sleepMs; Thread.Sleep(step); sleepMs -= step; }
+sealed class LightingOutput {
+  public readonly byte[] Frame;
+  public readonly int Brightness;
+  public readonly int ConfirmedAt;
+  public readonly string Note;
+  public readonly bool Off;
+
+  public LightingOutput(byte[] frame, int brightness, int confirmedAt, string note, bool off) {
+    Frame = frame;
+    Brightness = brightness;
+    ConfirmedAt = confirmedAt;
+    Note = note;
+    Off = off;
   }
-}static void SetBrightnessIfChanged(IntPtr h, int briPct) {
+}
+
+static volatile LightingOutput lightingOutput;
+static volatile int lightingConnection;
+static Color? singleColorDraft;
+static readonly Dictionary<string, string> effectColors = new Dictionary<string, string>();
+static readonly string[] lightingModes = { "heatmap", "level", "wave", "spectrum", "loadmeter", "breath", "rainbow", "static", "off", "custom", "singlecustom" };
+
+static string CanonicalEffect(string mode) {
+  return mode == "breathing" ? "breath" : mode == "temp" ? "heatmap" : mode == "none" ? "off" : mode;
+}
+
+static string EffectColor(string mode) {
+  lock (cfgLock) {
+    string color;
+    return effectColors.TryGetValue(CanonicalEffect(mode), out color) ? color : null;
+  }
+}
+
+static byte[] SolidFrame(byte red, byte green, byte blue) {
+  var frame = new byte[NUM_LED * 3];
+  for (int i = 0; i < frame.Length; i += 3) {
+    frame[i] = red; frame[i + 1] = green; frame[i + 2] = blue;
+  }
+  return frame;
+}
+
+static void TintFrame(byte[] frame, byte[] color, string mode, double phase) {
+  for (int i = 0; i < frame.Length; i += 3) {
+    int intensity = Math.Max(frame[i], Math.Max(frame[i + 1], frame[i + 2]));
+    if (mode == "rainbow" || mode == "spectrum") {
+      double offset = mode == "rainbow" ? (i / 3) * 2 * Math.PI / NUM_LED : 0;
+      intensity = (int)(intensity * (.62 + .38 * Math.Cos(phase / 600.0 - offset)));
+    }
+    for (int component = 0; component < 3; component++)
+      frame[i + component] = (byte)(intensity * color[component] / 255);
+  }
+}
+
+static void LedLoop() {
+  var clock = Stopwatch.StartNew();
+  string previousMode = "";
+  CustomEffect previousEffect = null;
+  long modeStarted = 0;
+  int previousConnection = -1;
+  while (_run) {
+    int connection = lightingConnection;
+    IntPtr device = devH;
+    if (connection != previousConnection) {
+      previousMode = "";
+      previousConnection = connection;
+    }
+    if (device == new IntPtr(-1)) { Thread.Sleep(100); continue; }
+
+    long now = clock.ElapsedMilliseconds;
+    string mode, baseColor, customColor;
+    int brightness;
+    CustomEffect customEffect;
+    Color? colorDraft;
+    bool isPaused, dimIdle, dimNight;
+    lock (cfgLock) {
+      mode = CanonicalEffect(led);
+      baseColor = ledColor;
+      effectColors.TryGetValue(mode, out customColor);
+      SavedEffect selected = mode == "custom" ? FindSavedEffect(selectedCustomId) : null;
+      customEffect = selected == null ? null : selected.Effect;
+      colorDraft = mode == "static" ? singleColorDraft : null;
+      brightness = bri; isPaused = paused; dimIdle = idleDim; dimNight = nightDim;
+    }
+    if (mode != previousMode || !ReferenceEquals(customEffect, previousEffect)) {
+      previousMode = mode;
+      previousEffect = customEffect;
+      modeStarted = now;
+    }
+    double phase = now - modeStarted;
+    double temp = Math.Max(curCpu, curGpu);
+    bool criticalBlink = critical > 0 && temp >= critical && !isPaused;
+    int requestedBrightness = brightness;
+    if (dimIdle && temp >= 0 && temp < 45 && !criticalBlink) brightness = Math.Min(brightness, IDLE_BRI);
+    int hour = DateTime.Now.Hour;
+    if (!criticalBlink && dimNight && (hour >= 22 || hour < 7)) brightness = Math.Min(brightness, NIGHT_BRI);
+
+    byte[] custom = customColor == null ? null : HexTo3(customColor);
+    byte[] baseRgb = colorDraft.HasValue
+      ? new[] { colorDraft.Value.R, colorDraft.Value.G, colorDraft.Value.B }
+      : custom ?? HexTo3(ColorName(baseColor)) ?? new byte[] { 255, 255, 255 };
+    bool dark = isPaused || mode == "off" || (criticalBlink && (now / 350) % 2 != 0);
+    bool solid = dark || criticalBlink || mode == "static" || mode == "singlecustom";
+    try {
+      byte[] frame;
+      if (solid) {
+        byte r = dark ? (byte)0 : Bake(criticalBlink ? 255 : baseRgb[0], brightness);
+        byte g = dark || criticalBlink ? (byte)0 : Bake(baseRgb[1], brightness);
+        byte b = dark || criticalBlink ? (byte)0 : Bake(baseRgb[2], brightness);
+        frame = SolidFrame(r, g, b);
+      } else {
+        switch (mode) {
+          case "rainbow": case "spectrum":
+            frame = RainbowFrame(phase / 16.0 % 360.0, brightness, mode == "spectrum");
+            break;
+          case "custom":
+            frame = customEffect != null ? RenderCustomEffect(customEffect, phase, brightness) :
+              WaveFrame(phase / 16.0, temp, brightness);
+            break;
+          case "wave": frame = WaveFrame(phase / 16.0, temp, brightness); break;
+          case "level": frame = LevelFrame(temp, brightness); break;
+          case "loadmeter": frame = LoadMeterFrame(cpuLoad, gpuLoad, temp, brightness); break;
+          case "breath": frame = BreathFrame(phase, temp, baseRgb[0], baseRgb[1], baseRgb[2], brightness); break;
+          default: frame = HeatmapFrame(temp, brightness); break;
+        }
+        if (custom != null && mode != "breath" && customEffect == null) TintFrame(frame, custom, mode, phase);
+      }
+      string note = isPaused ? "Paused" : criticalBlink ? "Temperature alert" :
+        brightness < requestedBrightness ? "auto dim" : "";
+      ApplyLightBarFrame(device, connection, frame, dark ? 0 : brightness, dark, note);
+    } catch (Exception error) {
+      LogCrash("lighting update: " + error.Message);
+      ApplyLightBarFailure(device, connection);
+    }
+    int sleep = Math.Max(1, 40 - (int)(clock.ElapsedMilliseconds - now));
+    while (sleep > 0 && _run) { int step = Math.Min(sleep, 40); Thread.Sleep(step); sleep -= step; }
+  }
+}
+
+static void ApplyLightBarFrame(IntPtr device, int connection, byte[] frame, int brightness, bool off, string note) {
+  lock (hidLock) {
+    if (device != devH || connection != lightingConnection) return;
+    LightingOutput output = lightingOutput;
+    int now = Environment.TickCount;
+    if (output != null && output.Frame != null && output.Off == off &&
+        unchecked(now - output.ConfirmedAt) < 1500 && frame.SequenceEqual(output.Frame)) {
+      if (output.Brightness != brightness || output.Note != note)
+        lightingOutput = new LightingOutput(output.Frame, brightness, output.ConfirmedAt, note, off);
+      return;
+    }
+    // Reassert the effect mode as well as still frames in case another controller changed it.
+    bool refreshMode = output == null || output.Frame == null || output.Off != off ||
+      unchecked(now - lightBarModeAt) >= 1500;
+    bool accepted = TrySendLightBar(device, frame, off, refreshMode);
+    if (accepted && refreshMode) lightBarModeAt = now;
+    lightingOutput = accepted ? new LightingOutput(frame, brightness, now, note, off)
+      : new LightingOutput(null, 0, 0, "", false);
+  }
+}
+
+static void ApplyLightBarFailure(IntPtr device, int connection) {
+  lock (hidLock) {
+    if (device == devH && connection == lightingConnection)
+      lightingOutput = new LightingOutput(null, 0, 0, "", false);
+  }
+}
+static void SetBrightnessIfChanged(IntPtr h, int briPct) {
   if (briPct == lastBriApplied) return;
   try { SetLedAllBrightness(h, briPct * 255 / 100); lastBriApplied = briPct; } catch { }
 }
@@ -749,77 +900,97 @@ static void ApplyHyperBoost(bool on) {
     RunPowerCfg("/setactive SCHEME_CURRENT");
   }
 }static void LoadConfig() {
-  try {
-    string p = ConfigPath();
-    if (!File.Exists(p)) return;
-    Dictionary<string, string> d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-    foreach (string line in File.ReadAllLines(p)) {
-      int eq = line.IndexOf('=');
-      if (eq <= 0) continue;
-      d[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
-    }
-    string sv;
-    if (d.TryGetValue("profile", out sv) && !string.IsNullOrEmpty(sv)) prof = sv.ToLowerInvariant();
-    if (d.TryGetValue("led", out sv) && !string.IsNullOrEmpty(sv)) led = sv.ToLowerInvariant();
-    if (d.TryGetValue("ledcolor", out sv) && !string.IsNullOrEmpty(sv)) ledColor = sv;
-    // accept the combined "static:red" / "static:FF0000" syntax in the cfg file too
-    if (led.StartsWith("static:")) { string cc2 = led.Substring(7); if (cc2.Length > 0) ledColor = cc2; led = "static"; }
-    bri = GetInt(d, "bri", bri);
-    interval = GetInt(d, "interval", interval);
-    critical = GetInt(d, "critical", critical);
-    maxStep = GetInt(d, "maxstep", maxStep);
-    autoTurbo = GetBool(d, "autoturbo", autoTurbo);
-    idleDim = GetBool(d, "idledim", idleDim);
-    nightDim = GetBool(d, "nightdim", nightDim);
-    loadBoost = GetBool(d, "loadboost", loadBoost);
-    keepOnExit = GetBool(d, "keeponexit", keepOnExit);
-    rpmCap = GetInt(d, "rpmcap", rpmCap);
-    capTemp = GetInt(d, "captemp", capTemp);
-    deadband = GetInt(d, "deadband", deadband);
-    downHold = GetInt(d, "downhold", downHold);
-    coolTail = GetBool(d, "cooltail", coolTail);
-    coolTemp = GetInt(d, "cooltemp", coolTemp);
-    hyperBoost = GetBool(d, "hyperboost", hyperBoost);
-    manual = GetBool(d, "manual", manual);
-    manualUnit = GetInt(d, "manualunit", manualUnit);
-    coast = GetInt(d, "coast", coast);
-    // The steadiness slider is the single source of truth for the three anti-hunt knobs.
-    int sm = GetInt(d, "smooth", -1);
-    if (sm >= 0) ApplySmooth(sm);
-  } catch { }
+  lock (cfgLock) {
+    try {
+      string p = ConfigPath();
+      if (!File.Exists(p)) return;
+      Dictionary<string, string> d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+      foreach (string line in File.ReadAllLines(p)) {
+        int eq = line.IndexOf('=');
+        if (eq <= 0) continue;
+        d[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+      }
+      string sv;
+      if (d.TryGetValue("profile", out sv) && !string.IsNullOrEmpty(sv)) prof = sv.ToLowerInvariant();
+      if (d.TryGetValue("led", out sv) && !string.IsNullOrEmpty(sv)) led = sv.ToLowerInvariant();
+      if (d.TryGetValue("ledcolor", out sv) && !string.IsNullOrEmpty(sv)) ledColor = sv;
+      // accept the combined "static:red" / "static:FF0000" syntax in the cfg file too
+      if (led.StartsWith("static:")) { string cc2 = led.Substring(7); if (cc2.Length > 0) ledColor = cc2; led = "static"; }
+      effectColors.Clear();
+      foreach (string mode in lightingModes)
+        if (d.TryGetValue("color." + mode, out sv) && sv.Length == 6 && HexTo3(sv) != null)
+          effectColors[mode] = sv;
+      bri = GetInt(d, "bri", bri);
+      ReadEffectLibrary(d);
+      interval = GetInt(d, "interval", interval);
+      critical = GetInt(d, "critical", critical);
+      maxStep = GetInt(d, "maxstep", maxStep);
+      autoTurbo = GetBool(d, "autoturbo", autoTurbo);
+      idleDim = GetBool(d, "idledim", idleDim);
+      nightDim = GetBool(d, "nightdim", nightDim);
+      loadBoost = GetBool(d, "loadboost", loadBoost);
+      keepOnExit = GetBool(d, "keeponexit", keepOnExit);
+      rpmCap = GetInt(d, "rpmcap", rpmCap);
+      capTemp = GetInt(d, "captemp", capTemp);
+      deadband = GetInt(d, "deadband", deadband);
+      downHold = GetInt(d, "downhold", downHold);
+      coolTail = GetBool(d, "cooltail", coolTail);
+      coolTemp = GetInt(d, "cooltemp", coolTemp);
+      hyperBoost = GetBool(d, "hyperboost", hyperBoost);
+      manual = GetBool(d, "manual", manual);
+      manualUnit = GetInt(d, "manualunit", manualUnit);
+      coast = GetInt(d, "coast", coast);
+      // The steadiness slider is the single source of truth for the three anti-hunt knobs.
+      int sm = GetInt(d, "smooth", -1);
+      if (sm >= 0) ApplySmooth(sm);
+    } catch { }
+  }
 }
-static void SaveConfig() {
-  try {
-    lastSelfSaveMs = Environment.TickCount;
-    string[] lines = new string[] {
-      "; RazerPadTray settings - edited automatically when you use the tray menu.",
-      "; The old CLI keeps its own autostart.cfg; this file only configures the tray app.",
-      "profile=" + prof,
-      "led=" + led,
-      "ledcolor=" + ledColor,
-      "bri=" + bri,
-      "interval=" + interval,
-      "critical=" + critical,
-      "maxstep=" + maxStep,
-      "autoturbo=" + (autoTurbo ? "true" : "false"),
-      "idledim=" + (idleDim ? "true" : "false"),
-      "nightdim=" + (nightDim ? "true" : "false"),
-      "loadboost=" + (loadBoost ? "true" : "false"),
-      "keeponexit=" + (keepOnExit ? "true" : "false"),
-      "rpmcap=" + rpmCap,
-      "captemp=" + capTemp,
-      "deadband=" + deadband,
-      "downhold=" + downHold,
-      "cooltail=" + (coolTail ? "true" : "false"),
-      "cooltemp=" + coolTemp,
-      "hyperboost=" + (hyperBoost ? "true" : "false"),
-      "manual=" + (manual ? "true" : "false"),
-      "manualunit=" + manualUnit,
-      "coast=" + coast,
-      "smooth=" + smooth
-    };
-    File.WriteAllLines(ConfigPath(), lines);
-  } catch { }
+static bool SaveConfig() {
+  lock (cfgLock) {
+    string path = ConfigPath();
+    string temporary = path + ".pending";
+    try {
+      lastSelfSaveMs = Environment.TickCount;
+      var lines = new List<string> {
+        "; RazerPadTray settings - edited automatically when you use the tray menu.",
+        "; The old CLI keeps its own autostart.cfg; this file only configures the tray app.",
+        "profile=" + prof,
+        "led=" + led,
+        "ledcolor=" + ledColor,
+        "bri=" + bri,
+        "interval=" + interval,
+        "critical=" + critical,
+        "maxstep=" + maxStep,
+        "autoturbo=" + (autoTurbo ? "true" : "false"),
+        "idledim=" + (idleDim ? "true" : "false"),
+        "nightdim=" + (nightDim ? "true" : "false"),
+        "loadboost=" + (loadBoost ? "true" : "false"),
+        "keeponexit=" + (keepOnExit ? "true" : "false"),
+        "rpmcap=" + rpmCap,
+        "captemp=" + capTemp,
+        "deadband=" + deadband,
+        "downhold=" + downHold,
+        "cooltail=" + (coolTail ? "true" : "false"),
+        "cooltemp=" + coolTemp,
+        "hyperboost=" + (hyperBoost ? "true" : "false"),
+        "manual=" + (manual ? "true" : "false"),
+        "manualunit=" + manualUnit,
+        "coast=" + coast,
+        "smooth=" + smooth
+      };
+      foreach (var entry in effectColors) lines.Add("color." + entry.Key + "=" + entry.Value);
+      WriteEffectLibrary(lines);
+      File.WriteAllLines(temporary, lines);
+      if (File.Exists(path)) File.Replace(temporary, path, null);
+      else File.Move(temporary, path);
+      return true;
+    } catch (Exception error) {
+      try { File.Delete(temporary); } catch { }
+      LogCrash("settings save: " + error.Message);
+      return false;
+    }
+  }
 }
 static void WorkerLoop() {
   int loopN = 0, ledPhase = 0, lastLedMs = 0, lastBlinkMs = 0;
@@ -1058,7 +1229,7 @@ static void LedClick(object s, EventArgs e) {
   ToolStripMenuItem mi = (ToolStripMenuItem)s;
   string tag = (string)mi.Tag;
   lock (cfgLock) {
-    if (tag.StartsWith("static:")) { led = "static"; ledColor = tag.Substring(7); }
+    if (tag.StartsWith("static:")) { led = "static"; ledColor = tag.Substring(7); effectColors.Remove("static"); }
     else led = tag;
   }
   string baseTag = tag.StartsWith("static:") ? "static" : tag;
@@ -1069,14 +1240,16 @@ static void LedClick(object s, EventArgs e) {
   }
   ledDirty = true;
   SaveConfig();
+  SyncDash();
 }
 static void BriClick(object s, EventArgs e) {
   ToolStripMenuItem mi = (ToolStripMenuItem)s;
   int v = Convert.ToInt32(mi.Tag);
-  lock (cfgLock) { bri = v; }
+  SetLightingBrightness(v);
   CheckGroup(briItems, mi.Tag.ToString());
   ledDirty = true;
   SaveConfig();
+  SyncDash();
 }
 static void PauseClick(object s, EventArgs e) {
   paused = !paused;
@@ -1283,6 +1456,8 @@ static ContextMenuStrip BuildMenu() {
   return m;
 }
 static void UiTick(object s, EventArgs e) {
+  FanHistory.Record(devH != new IntPtr(-1) && !paused ? curRpm : -1);
+  if (coolingHistory != null && !coolingHistory.IsDisposed && coolingHistory.Visible) coolingHistory.Invalidate();
   if (tray == null) return;
   int t = Math.Max(curCpu, curGpu);
   string head = paused ? "RazerPad (paused)" : "RazerPad Fan Control";
@@ -1311,13 +1486,31 @@ static void UiTick(object s, EventArgs e) {
 // ===================== v8 dashboard: a Synapse-style control window =====================
 // Shares the exact engine/threads/globals of the tray (tray stays the source of truth).
 // Every control writes the same globals + SaveConfig(), so window and tray menu stay in sync.
-static readonly Color GraphiteBackground = Color.FromArgb(15, 16, 17);
-static readonly Color GraphitePanel = Color.FromArgb(24, 25, 26);
-static readonly Color GraphiteBorder = Color.FromArgb(60, 62, 65);
-static readonly Color GraphiteAccent = Color.FromArgb(155, 248, 0);
-static Panel automaticControls, manualControls, turboControls, automationOptions, lightingOptions, deviceOptions, speedMeter;
-static Label overrideStatus;
+static readonly Color GraphiteBackground = Color.FromArgb(15, 16, 27);
+static readonly Color GraphitePanel = Color.FromArgb(23, 23, 37);
+static readonly Color GraphiteBorder = Color.FromArgb(64, 60, 85);
+static readonly Color GraphiteAccent = Color.FromArgb(175, 129, 255);
+static readonly Color SurfaceEdge = Color.FromArgb(54, 51, 73);
+static Panel automaticControls, manualControls, turboControls, lightingOptions;
+static Label overrideStatus, deviceConnection, lightingStatus;
+static FanHistory coolingHistory;
 static ToolStripMenuItem pauseItem;
+
+[DllImport("dwmapi.dll")]
+static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
+
+static void ApplyDashboardCaption(Form window) {
+  if (SystemInformation.HighContrast) return;
+  const int immersiveDarkModeAttribute = 20;
+  const int captionColorAttribute = 35;
+  const int textColorAttribute = 36;
+  int dark = 1;
+  int caption = ColorTranslator.ToWin32(GraphiteBackground);
+  int text = ColorTranslator.ToWin32(window.ForeColor);
+  DwmSetWindowAttribute(window.Handle, immersiveDarkModeAttribute, ref dark, sizeof(int));
+  if (DwmSetWindowAttribute(window.Handle, captionColorAttribute, ref caption, sizeof(int)) == 0)
+    DwmSetWindowAttribute(window.Handle, textColorAttribute, ref text, sizeof(int));
+}
 
 static void ShowDashboard() {
   if (dash != null && !dash.IsDisposed) {
@@ -1339,245 +1532,121 @@ static void ShowDashboard() {
   window.BackColor = GraphiteBackground;
   window.ForeColor = Color.FromArgb(232, 240, 250);
   window.Font = new Font("Segoe UI", 10f);
-  window.MinimumSize = new Size(690, 475);
+  window.MinimumSize = new Size(730, 460);
   window.AutoScaleMode = AutoScaleMode.Dpi;
   window.FormClosing += DashClosing;
-  try { window.Icon = MakeIcon(Math.Max(0, Math.Max(curCpu, curGpu))); } catch { }
+  window.ShowIcon = false;
+  window.HandleCreated += delegate { ApplyDashboardCaption(window); };
 
-  TableLayoutPanel shell = new TableLayoutPanel {
-    Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, CellBorderStyle = TableLayoutPanelCellBorderStyle.Single
+  var shell = new TableLayoutPanel {
+    Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(18, 7, 18, 16)
   };
-  shell.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
-  shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55));
-  shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
+  shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+  shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
   shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
   window.Controls.Add(shell);
 
-  FlowLayoutPanel navigation = new FlowLayoutPanel {
-    Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false,
-    Padding = new Padding(0, 20, 0, 0), Margin = Padding.Empty, BackColor = GraphiteBackground
-  };
-  shell.Controls.Add(navigation, 0, 0);
-
-  TableLayoutPanel telemetry = new TableLayoutPanel {
-    Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(18), Margin = Padding.Empty
-  };
-  telemetry.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-  telemetry.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-  telemetry.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
-  telemetry.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
-  shell.Controls.Add(telemetry, 1, 0);
-
-  speedMeter = new FanDial { Dock = DockStyle.Fill, AccessibleName = "Commanded fan speed" };
-  telemetry.Controls.Add(speedMeter, 0, 0);
-  TableLayoutPanel temperatures = GraphiteGrid(2);
-  temperatures.Dock = DockStyle.Fill;
-  telemetry.Controls.Add(temperatures, 0, 1);
-  lblCpu = AddTemperature(temperatures, "CPU", 0);
-  lblGpu = AddTemperature(temperatures, "GPU", 1);
-  lblHead = GraphiteText("Connecting to cooling pad", 10, Color.Silver);
-  lblHead.TextAlign = ContentAlignment.MiddleCenter;
+  var header = GraphiteGrid(3);
+  header.Dock = DockStyle.Fill;
+  header.Margin = Padding.Empty;
+  header.Padding = new Padding(4, 2, 4, 2);
+  header.ColumnStyles[0].Width = 27;
+  header.ColumnStyles[1].Width = 46;
+  header.ColumnStyles[2].Width = 27;
+  shell.Controls.Add(header, 0, 0);
+  Label heading = GraphiteText("RazerPad Control", 14, Color.White);
+  heading.Dock = DockStyle.Fill;
+  heading.AutoEllipsis = true;
+  heading.TextAlign = ContentAlignment.MiddleLeft;
+  header.Controls.Add(heading, 0, 0);
+  var navigation = GraphiteGrid(3, 25);
+  navigation.Dock = DockStyle.Fill;
+  navigation.Padding = new Padding(4);
+  header.Controls.Add(navigation, 1, 0);
+  lblHead = GraphiteText("Connecting", 9, WorkspaceMuted);
+  lblHead.TextAlign = ContentAlignment.MiddleRight;
   lblHead.Dock = DockStyle.Fill;
-  telemetry.Controls.Add(lblHead, 0, 2);
+  header.Controls.Add(lblHead, 2, 0);
 
-  TableLayoutPanel right = new TableLayoutPanel {
-    Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(16, 18, 16, 20), Margin = Padding.Empty
-  };
-  right.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-  right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-  right.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-  shell.Controls.Add(right, 2, 0);
-  Panel scroll = new Panel { AutoScroll = true, Dock = DockStyle.Fill, Margin = Padding.Empty };
-  right.Controls.Add(scroll, 0, 0);
-  TableLayoutPanel cooling = GraphiteGrid(1);
-  cooling.Dock = DockStyle.Top;
-  scroll.Controls.Add(cooling);
+  var pagesHost = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0, 13, 0, 0) };
+  shell.Controls.Add(pagesHost, 0, 1);
+  Panel coolingPage = BuildCoolingPage();
+  Panel devicePage = BuildDevicePage();
+  Panel lightingPage = WorkspacePage();
+  Panel customPage = WorkspacePage();
+  var lightingLayout = StudioLayout(lightingPage);
+  GraphiteAdd(lightingLayout, GraphiteText("Lighting", 24, Color.White));
+  var lightingColumns = StudioColumns(41, 59);
+  var visual = GraphiteGrid(1);
+  visual.Margin = new Padding(0, 8, 20, 0);
+  GraphiteAdd(visual, GraphiteText("Lighting theme", 18, Color.White));
+  GraphiteAdd(visual, GraphiteText("Choose one theme", 10, WorkspaceMuted));
+  lightingPreview = new PadPreview { Height = 292, AccessibleName = "Active lighting preview" };
+  GraphiteAdd(visual, lightingPreview);
+  lightingStatus = GraphiteText("Connecting to pad lighting…", 9, WorkspaceMuted);
+  lightingStatus.TextAlign = ContentAlignment.MiddleCenter;
+  GraphiteAdd(visual, lightingStatus);
+  GraphiteAdd(lightingColumns, visual, 0, 0);
+  GraphiteAdd(lightingLayout, lightingColumns);
 
-  TableLayoutPanel profiles = GraphiteGrid(1);
-  profiles.Margin = new Padding(0, 4, 0, 0);
-  GraphiteAdd(profiles, GraphiteText("Fan Profile", 14, Color.Silver));
-  TableLayoutPanel choices = GraphiteGrid(5);
-  profBtns.Clear();
-  foreach (string name in new[] { "Quiet", "Balanced", "Performance", "Turbo", "Manual" }) {
-    Button button = GraphiteButton(name);
-    button.Height = 68;
-    button.Font = new Font("Segoe UI", 8.5f);
-    button.AutoEllipsis = true;
-    button.Image = InstrumentIcon(name == "Manual" ? "Manual" : "Cooling");
-    button.TextImageRelation = TextImageRelation.ImageAboveText;
-    button.Margin = new Padding(0, 0, 2, 0);
-    button.Click += delegate {
-      lock (cfgLock) {
-        manual = name == "Manual";
-        if (!manual) prof = name.ToLowerInvariant();
-      }
-      CheckGroup(fanItems, manual ? "" : prof);
-      SaveConfig();
-      ledDirty = true;
-      SyncDash();
-    };
-    GraphiteAdd(choices, button, profBtns.Count, 0);
-    profBtns.Add(button);
-  }
-  GraphiteAdd(profiles, choices);
-  GraphiteAdd(cooling, profiles);
-  AddInstrumentDivider(cooling);
+  var editorLayout = StudioLayout(customPage);
+  var editorColumns = StudioColumns(37, 63);
+  var draftVisual = GraphiteGrid(1);
+  draftVisual.Margin = new Padding(0, 32, 22, 0);
+  var editorPreview = new PadPreview { Height = 343, AccessibleName = "Custom effect draft preview" };
+  GraphiteAdd(draftVisual, editorPreview);
+  var draftCaption = GraphiteText("Draft preview", 9, WorkspaceMuted);
+  draftCaption.TextAlign = ContentAlignment.MiddleCenter;
+  GraphiteAdd(draftVisual, draftCaption);
+  GraphiteAdd(editorColumns, draftVisual, 0, 0);
+  GraphiteAdd(editorLayout, editorColumns);
 
-  TableLayoutPanel automatic = GraphiteGrid(1);
-  automaticControls = automatic;
-  tbSmooth = AddSlider(automatic, "Fan Steadiness", 0, 100, out lblSmoothVal, SmoothChanged);
-  TableLayoutPanel sliderEnds = GraphiteGrid(2);
-  GraphiteAdd(sliderEnds, GraphiteText("More responsive", 8, Color.Silver), 0, 0);
-  Label steadyEnd = GraphiteText("More steady", 8, Color.Silver);
-  steadyEnd.TextAlign = ContentAlignment.MiddleRight;
-  GraphiteAdd(sliderEnds, steadyEnd, 1, 0);
-  GraphiteAdd(automatic, sliderEnds);
-  GraphiteAdd(cooling, automatic);
-
-  TableLayoutPanel fixedSpeed = GraphiteGrid(1);
-  manualControls = fixedSpeed;
-  tbFan = AddSlider(fixedSpeed, "Target speed", MIN_UNIT, MAX_UNIT, out lblFanVal, FanSliderChanged);
-  GraphiteAdd(fixedSpeed, GraphiteText("500–3,200 RPM in 50 RPM steps", 8, Color.Silver));
-  GraphiteAdd(cooling, fixedSpeed);
-
-  TableLayoutPanel maxSpeed = GraphiteGrid(1);
-  turboControls = maxSpeed;
-  GraphiteAdd(maxSpeed, GraphiteText("3,200 RPM fixed speed", 12, GraphiteAccent));
-  GraphiteAdd(cooling, maxSpeed);
-  TableLayoutPanel automation = GraphiteGrid(1);
-  automationOptions = automation;
-  ckAutoTurbo = AddCheck(automation, "Auto-Turbo at high temperatures");
-  ckLoadBoost = AddCheck(automation, "Boost fan ahead of load");
-  ckWearCap = AddCheck(automation, "Limit fan speed while cool");
-  ckSteady = AddCheck(automation, "Steady speed control");
-  AddInstrumentDivider(cooling);
-  AddDisclosure(cooling, "Fan Automation", automation);
-
-  TableLayoutPanel lighting = GraphiteCard("Lighting");
-  lighting.Margin = new Padding(6, 0, 0, 0);
-  cbLed = new ComboBox {
-    DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
-    DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 23, FormattingEnabled = true,
-    BackColor = GraphiteBackground, ForeColor = window.ForeColor, AccessibleName = "Lighting effect"
-  };
-  cbLed.Items.AddRange(new object[] { "heatmap", "level", "wave", "spectrum", "loadmeter", "breath", "rainbow", "static", "off" });
-  cbLed.Format += delegate (object sender, ListControlConvertEventArgs e) {
-    string effect = (string)e.ListItem;
-    e.Value = effect == "loadmeter" ? "Load meter" :
-              effect.Length > 0 ? char.ToUpperInvariant(effect[0]) + effect.Substring(1) : effect;
-  };
-  cbLed.DrawItem += delegate (object sender, DrawItemEventArgs e) {
-    bool selected = (e.State & DrawItemState.Selected) != 0;
-    using (Brush background = new SolidBrush(selected ? Color.FromArgb(47, 67, 19) : GraphiteBackground))
-      e.Graphics.FillRectangle(background, e.Bounds);
-    if (e.Index >= 0) {
-      Rectangle textBounds = Rectangle.Inflate(e.Bounds, -6, 0);
-      TextRenderer.DrawText(e.Graphics, cbLed.GetItemText(cbLed.Items[e.Index]), cbLed.Font,
-                            textBounds, cbLed.ForeColor, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+  Control[] pages = { coolingPage, lightingPage, devicePage, customPage };
+  foreach (Control page in pages) pagesHost.Controls.Add(page);
+  var navigationButtons = new List<RoundedButton>();
+  CustomEffectEditor editor = null;
+  Action<int> showPage = delegate(int selectedPage) {
+    lightingGallery.CloseColorPicker();
+    if (selectedPage != 3) editor.End();
+    for (int index = 0; index < pages.Length; index++) pages[index].Visible = index == selectedPage;
+    for (int index = 0; index < navigationButtons.Count; index++) {
+      bool selected = index == (selectedPage == 3 ? 1 : selectedPage);
+      navigationButtons[index].Quiet = !selected;
+      navigationButtons[index].FillColor = PrimaryButtonFill;
+      navigationButtons[index].ForeColor = selected ? Color.White : WorkspaceText;
+      navigationButtons[index].AccessibleDescription = selected ? "Selected page" : "";
     }
-    e.DrawFocusRectangle();
+    pages[selectedPage].BringToFront();
   };
-  cbLed.SelectedIndexChanged += LedComboChanged;
-  GraphiteAdd(lighting, cbLed);
-  TableLayoutPanel swatches = GraphiteGrid(8);
-  colorSwatches.Clear();
-  foreach (string name in new[] { "cyan", "blue", "purple", "pink", "red", "orange", "green", "white" }) {
-    Button swatch = GraphiteButton("");
-    swatch.Height = 24;
-    swatch.Margin = new Padding(0, 2, 5, 2);
-    swatch.AccessibleName = name + " static lighting";
-    swatch.BackColor = ParseHex(ColorName(name));
-    swatch.Click += delegate {
-      lock (cfgLock) { led = "static"; ledColor = name; }
-      CheckGroup(ledItems, "static:" + name);
-      SaveConfig();
-      ledDirty = true;
-      SyncDash();
-    };
-    GraphiteAdd(swatches, swatch, colorSwatches.Count, 0);
-    colorSwatches.Add(name, swatch);
-  }
-  GraphiteAdd(lighting, swatches);
-  TableLayoutPanel lightSettings = GraphiteGrid(1);
-  lightingOptions = lightSettings;
-  tbBri = AddSlider(lightSettings, "Brightness", 0, 100, out lblBriVal, BriSliderChanged);
-  ckIdleDim = AddCheck(lightSettings, "Dim when idle or cool");
-  ckNightDim = AddCheck(lightSettings, "Dim at night (22:00–07:00)");
-  AddDisclosure(lighting, "Lighting options", lightSettings);
-  TableLayoutPanel device = GraphiteCard("Device");
-  device.Margin = new Padding(0, 0, 6, 0);
-  ckHyper = AddCheck(device, "HyperBoost (plugged in)");
-  TableLayoutPanel deviceSettings = GraphiteGrid(1);
-  deviceOptions = deviceSettings;
-  ckAutoStart = AddCheck(deviceSettings, "Start with Windows");
-  ckCoolTail = AddCheck(deviceSettings, "Wind fan down on exit");
-  Button exit = GraphiteButton("Exit app");
-  exit.Click += ExitClick;
-  GraphiteAdd(deviceSettings, exit);
-  AddDisclosure(device, "Device options", deviceSettings);
-  lighting.Dock = device.Dock = DockStyle.Top;
-  lighting.Hide();
-  device.Hide();
-  scroll.Controls.Add(lighting);
-  scroll.Controls.Add(device);
-  TableLayoutPanel[] pages = { cooling, lighting, device };
-  List<Button> navigationButtons = new List<Button>();
+  editor = new CustomEffectEditor(delegate { showPage(1); lightingGallery.FocusSelection(); });
+  editorPreview.DraftFrame = editor.PreviewFrame;
+  GraphiteAdd(editorColumns, editor, 1, 0);
+  lightingGallery = new LightingGallery(delegate(SavedEffect entry) {
+    editor.Begin(entry);
+    showPage(3);
+    editor.FocusName();
+  });
+  GraphiteAdd(lightingColumns, lightingGallery, 1, 0);
+
   string[] pageNames = { "Cooling", "Lighting", "Device" };
-  for (int i = 0; i < pages.Length; i++) {
-    int selectedPage = i;
-    Button tab = GraphiteButton(pageNames[i]);
-    tab.Size = new Size(110, 88);
+  for (int i = 0; i < pageNames.Length; i++) {
+    int index = i;
+    RoundedButton tab = GraphiteButton(pageNames[i]);
+    tab.Height = 43;
+    tab.Dock = DockStyle.Fill;
     tab.Image = InstrumentIcon(pageNames[i]);
-    tab.TextImageRelation = TextImageRelation.ImageAboveText;
+    tab.TextImageRelation = TextImageRelation.ImageBeforeText;
     tab.FlatAppearance.BorderSize = 0;
-    tab.Margin = Padding.Empty;
-    tab.BackColor = i == 0 ? Color.FromArgb(33, 44, 18) : GraphiteBackground;
-    tab.ForeColor = i == 0 ? GraphiteAccent : Color.Silver;
-    tab.Click += delegate {
-      for (int index = 0; index < pages.Length; index++) {
-        bool active = index == selectedPage;
-        pages[index].Visible = active;
-        navigationButtons[index].BackColor = active ? Color.FromArgb(33, 44, 18) : GraphiteBackground;
-        navigationButtons[index].ForeColor = active ? GraphiteAccent : Color.Silver;
-      }
-      pages[selectedPage].BringToFront();
-    };
+    tab.Margin = new Padding(2, 0, 2, 0);
+    tab.Click += delegate { showPage(index); };
     navigationButtons.Add(tab);
-    navigation.Controls.Add(tab);
+    navigation.Controls.Add(tab, i, 0);
   }
-
-  TableLayoutPanel actions = GraphiteGrid(1);
-  actions.Dock = DockStyle.Top;
-  AddInstrumentDivider(actions);
-  overrideStatus = GraphiteText("", 9, Color.Silver);
-  GraphiteAdd(actions, overrideStatus);
-  TableLayoutPanel buttons = GraphiteGrid(2);
-  buttons.ColumnStyles.Clear();
-  buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
-  buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 68));
-  btnPause = GraphiteButton("Pause");
-  btnPause.Height = 58;
-  btnPause.Image = InstrumentIcon("Pause");
-  btnPause.TextImageRelation = TextImageRelation.ImageBeforeText;
-  btnPause.Margin = new Padding(0, 0, 5, 0);
-  btnPause.Click += PauseClick;
-  btnTurbo = GraphiteButton("Turbo Burst · 2 min");
-  btnTurbo.Height = 58;
-  btnTurbo.Font = new Font("Segoe UI Semibold", 11);
-  btnTurbo.BackColor = GraphiteAccent;
-  btnTurbo.ForeColor = GraphiteBackground;
-  btnTurbo.FlatAppearance.MouseOverBackColor = Color.FromArgb(187, 255, 57);
-  btnTurbo.Click += TurboBurstClick;
-  GraphiteAdd(buttons, btnPause, 0, 0);
-  GraphiteAdd(buttons, btnTurbo, 1, 0);
-  GraphiteAdd(actions, buttons);
-  right.Controls.Add(actions, 0, 1);
-
+  showPage(0);
   dash = window;
   WireToggles();
-  automationOptions.Hide();
   lightingOptions.Hide();
-  deviceOptions.Hide();
+
   window.Shown += delegate {
     SyncDash();
     DashTick(null, EventArgs.Empty);
@@ -1588,19 +1657,21 @@ static void ShowDashboard() {
   dashTimer.Start();
 }
 
-static void AddInstrumentDivider(TableLayoutPanel grid) {
-  Panel line = new Panel { Height = 1, BackColor = GraphiteBorder };
-  GraphiteAdd(grid, new Panel { Height = 12 });
-  GraphiteAdd(grid, line);
-  GraphiteAdd(grid, new Panel { Height = 12 });
-}
-
 static Bitmap InstrumentIcon(string kind) {
   Bitmap image = new Bitmap(28, 28);
   using (Graphics g = Graphics.FromImage(image))
   using (Pen pen = new Pen(Color.Silver, 1.7f)) {
     g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
     switch (kind) {
+      case "HyperBoost":
+        g.DrawPolygon(pen, new[] { new Point(16, 3), new Point(6, 16), new Point(13, 16),
+                                   new Point(12, 25), new Point(23, 11), new Point(16, 11) });
+        break;
+      case "Windows":
+        g.DrawPolygon(pen, new[] { new Point(3, 7), new Point(25, 4), new Point(25, 24), new Point(3, 21) });
+        g.DrawLine(pen, 13, 6, 13, 22);
+        g.DrawLine(pen, 3, 14, 25, 14);
+        break;
       case "Lighting":
         g.DrawArc(pen, 6, 3, 16, 17, 145, 250);
         g.DrawLines(pen, new[] { new Point(8, 16), new Point(11, 21), new Point(17, 21), new Point(20, 16) });
@@ -1646,63 +1717,235 @@ static void PaintFan(Graphics g, float scale) {
   g.Restore(state);
 }
 
-sealed class FanDial : Panel {
-  public FanDial() {
+sealed class FanHistory : Panel {
+  const int MaxHistoryMs = 600000;
+  static readonly Queue<KeyValuePair<int, int>> samples = new Queue<KeyValuePair<int, int>>();
+  readonly RoundedButton range;
+  readonly ContextMenuStrip ranges = new ContextMenuStrip();
+  int minutes = 5;
+
+  public FanHistory() {
     DoubleBuffered = true;
     ResizeRedraw = true;
+    range = GraphiteButton("Last 5 min  ▾");
+    range.AccessibleName = "Fan history range";
+    range.Width = 108;
+    range.Height = 28;
+    range.CornerRadius = 6;
+    range.Font = new Font("Segoe UI", 8.5f);
+    range.Click += delegate {
+      foreach (ToolStripMenuItem item in ranges.Items) item.Checked = (int)item.Tag == minutes;
+      ranges.Show(range, new Point(0, range.Height));
+    };
+    Controls.Add(range);
+    ranges.BackColor = GraphitePanel;
+    ranges.ForeColor = WorkspaceText;
+    foreach (int span in new[] { 1, 5, 10 }) {
+      var choice = new ToolStripMenuItem("Last " + span + " min") { Tag = span };
+      choice.Click += delegate {
+        minutes = span;
+        range.Text = choice.Text + "  ▾";
+        Invalidate();
+      };
+      ranges.Items.Add(choice);
+    }
+  }
+
+  public static void Record(int rpm) {
+    int now = Environment.TickCount;
+    while (samples.Count != 0 && unchecked(now - samples.Peek().Key) > MaxHistoryMs) samples.Dequeue();
+    samples.Enqueue(new KeyValuePair<int, int>(now, rpm));
+  }
+
+  protected override void OnResize(EventArgs e) {
+    base.OnResize(e);
+    if (range != null) range.Location = new Point(Width - range.Width - 12, 7);
+  }
+
+  protected override void Dispose(bool disposing) {
+    if (disposing) ranges.Dispose();
+    base.Dispose(disposing);
   }
 
   protected override void OnPaint(PaintEventArgs e) {
     base.OnPaint(e);
-    int size = Math.Min(ClientSize.Width, ClientSize.Height);
-    if (size < 40) return;
+    if (Width < 140 || Height < 95) return;
     Graphics g = e.Graphics;
-    var state = g.Save();
     g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-    g.TranslateTransform(ClientSize.Width / 2f, ClientSize.Height / 2f);
-    g.ScaleTransform(size / 440f, size / 440f);
-    using (var surface = new System.Drawing.Drawing2D.HatchBrush(
-      System.Drawing.Drawing2D.HatchStyle.LightDownwardDiagonal, Color.FromArgb(22, 24, 22), GraphiteBackground))
-      g.FillEllipse(surface, -190, -190, 380, 380);
-    using (Pen rim = new Pen(GraphiteBorder, 6))
-      g.DrawArc(rim, -208, -208, 416, 416, 135, 270);
-    const int segments = 56;
-    int rpm = curRpm;
-    int active = Math.Min(segments, Math.Max(0, rpm) * segments / (MAX_UNIT * FACTOR));
-    using (Pen lit = new Pen(GraphiteAccent, 19))
-    using (Pen unlit = new Pen(GraphiteBorder, 19))
-    using (Pen tick = new Pen(Color.Silver, 1.4f)) {
-      for (int i = 0; i < segments; i++)
-        g.DrawArc(i < active ? lit : unlit, -192, -192, 384, 384, 135 + 270f * i / segments, 3.9f);
-      for (int i = 0; i <= 18; i++) {
-        double angle = (135 + i * 15) * Math.PI / 180;
-        int inner = i % 3 == 0 ? 150 : 158;
-        g.DrawLine(tick, (float)Math.Cos(angle) * inner, (float)Math.Sin(angle) * inner,
-                   (float)Math.Cos(angle) * 168, (float)Math.Sin(angle) * 168);
+    PaintSurface(g, new Rectangle(1, 1, Width - 3, Height - 3), 13, GraphitePanel, SurfaceEdge, 0);
+    using (var grid = new Pen(SurfaceEdge))
+    using (var trace = new Pen(GraphiteAccent, 2f)) {
+      TextRenderer.DrawText(g, "Fan command history", Font, new Point(16, 11), Color.White);
+      Rectangle plot = Rectangle.FromLTRB(67, 45, Width - 24, Height - 35);
+      int maxRpm = MAX_UNIT * FACTOR;
+      for (int i = 0; i <= 4; i++) {
+        int y = plot.Top + i * plot.Height / 4;
+        g.DrawLine(grid, plot.Left, y, plot.Right, y);
+        TextRenderer.DrawText(g, (maxRpm - i * maxRpm / 4).ToString("N0"), Font,
+          new Rectangle(8, y - 9, 49, 18), WorkspaceMuted, TextFormatFlags.Right);
+      }
+      int segments = plot.Width > 395 && minutes > 1 ? 5 : 2;
+      for (int i = 0; i <= segments; i++) {
+        int x = plot.Left + i * plot.Width / segments;
+        int seconds = minutes * 60 * (segments - i) / segments;
+        g.DrawLine(grid, x, plot.Top, x, plot.Bottom);
+        string label = seconds == 0 ? "Now" : "−" + (seconds / 60) + ":" + (seconds % 60).ToString("00");
+        TextRenderer.DrawText(g, label, Font, new Rectangle(x - 26, plot.Bottom + 7, 52, 18), WorkspaceMuted,
+                              TextFormatFlags.HorizontalCenter);
+      }
+      var points = new List<PointF>();
+      int now = Environment.TickCount;
+      int window = minutes * 60000;
+      int last = 0;
+      using (var fill = new LinearGradientBrush(plot, Color.FromArgb(106, 137, 68, 255),
+                                                 Color.FromArgb(8, 137, 68, 255), 90f)) {
+        foreach (var sample in samples) {
+          int age = unchecked(now - sample.Key);
+          if (age > window) continue;
+          if (sample.Value < 0 || points.Count > 0 && unchecked(sample.Key - last) > 3200) {
+            PaintRun(g, trace, fill, points, plot.Bottom);
+            points.Clear();
+          }
+          if (sample.Value < 0) continue;
+          points.Add(new PointF(plot.Right - plot.Width * age / (float)window,
+            plot.Bottom - plot.Height * Math.Min(maxRpm, sample.Value) / (float)maxRpm));
+          last = sample.Key;
+        }
+        PaintRun(g, trace, fill, points, plot.Bottom);
+        if (points.Count > 0) {
+          PointF latest = points[points.Count - 1];
+          g.FillEllipse(Brushes.White, latest.X - 3, latest.Y - 3, 6, 6);
+          g.DrawEllipse(trace, latest.X - 3, latest.Y - 3, 6, 6);
+        }
       }
     }
-    var fan = g.Save();
-    g.TranslateTransform(0, -64);
-    PaintFan(g, 1.9f);
-    g.Restore(fan);
-    using (var centered = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-    using (var valueFont = new Font("Bahnschrift", 74, GraphicsUnit.Pixel))
-    using (var unitFont = new Font("Segoe UI Semibold", 20, GraphicsUnit.Pixel)) {
-      g.DrawString(rpm < 0 ? "—" : rpm.ToString("N0"), valueFont, Brushes.White, new PointF(0, 12), centered);
-      g.DrawString("R P M", unitFont, Brushes.Silver, new PointF(0, 66), centered);
-    }
-    g.Restore(state);
+  }
+
+  static void PaintRun(Graphics graphics, Pen trace, Brush fill, List<PointF> points, float bottom) {
+    if (points.Count < 2) return;
+    PointF[] line = points.ToArray();
+    var area = new PointF[line.Length + 2];
+    line.CopyTo(area, 0);
+    area[line.Length] = new PointF(line[line.Length - 1].X, bottom);
+    area[line.Length + 1] = new PointF(line[0].X, bottom);
+    graphics.FillPolygon(fill, area);
+    graphics.DrawLines(trace, line);
   }
 }
 
-static TableLayoutPanel GraphiteGrid(int columns) {
-  TableLayoutPanel panel = new TableLayoutPanel {
-    AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = columns,
-    Margin = Padding.Empty, GrowStyle = TableLayoutPanelGrowStyle.AddRows
-  };
+sealed class PadPreview : Panel {
+  readonly Bitmap pad;
+  readonly System.Windows.Forms.Timer refresh;
+  byte[] renderedFrame;
+  public Func<byte[]> DraftFrame;
+  public bool Compact;
+
+  public PadPreview() {
+    DoubleBuffered = true;
+    ResizeRedraw = true;
+    using (Stream asset = typeof(PadPreview).Assembly.GetManifestResourceStream("CoolingPadArtwork"))
+    using (var image = Image.FromStream(asset))
+      pad = new Bitmap(image);
+    refresh = new System.Windows.Forms.Timer { Interval = 33 };
+    refresh.Tick += delegate {
+      LightingOutput output = lightingOutput;
+      byte[] latest = DraftFrame != null ? DraftFrame() : output == null ? null : output.Frame;
+      if (!ReferenceEquals(latest, renderedFrame)) {
+        renderedFrame = latest;
+        Invalidate();
+      }
+    };
+    VisibleChanged += delegate { refresh.Enabled = Visible; };
+  }
+
+  protected override void Dispose(bool disposing) {
+    if (disposing) {
+      if (refresh != null) refresh.Dispose();
+      if (pad != null) pad.Dispose();
+    }
+    base.Dispose(disposing);
+  }
+
+  protected override void OnPaint(PaintEventArgs e) {
+    base.OnPaint(e);
+    if (Width < 65 || Height < 48) return;
+    Graphics g = e.Graphics;
+    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+    float scale = Math.Min((Width - 10) / (float)pad.Width, (Height - (Compact ? 12 : 24)) / (float)pad.Height);
+    int w = (int)(pad.Width * scale), h = (int)(pad.Height * scale);
+    var device = new Rectangle((Width - w) / 2, (Height - h) / 2 - 2, w, h);
+    var ambient = Rectangle.Inflate(device, Math.Max(12, w / 5), Math.Max(24, h / 3));
+    using (var halo = new GraphicsPath()) {
+      halo.AddEllipse(ambient);
+      using (var light = new PathGradientBrush(halo)) {
+        light.CenterColor = Color.FromArgb(146, 83, 44, 157);
+        light.SurroundColors = new[] { Color.FromArgb(0, 83, 44, 157) };
+        g.FillPath(light, halo);
+      }
+    }
+    g.DrawImage(pad, device);
+    byte[] frame = renderedFrame;
+    if (frame == null) return;
+    int lightWidth = (int)(device.Width * .865f);
+    int x = device.Left + (device.Width - lightWidth) / 2;
+    int y = device.Top + (int)(device.Height * .942f);
+    DrawPadLight(g, new Rectangle(x, y, lightWidth, Math.Max(2, device.Height / 115)), frame);
+  }
+
+  static void DrawPadLight(Graphics graphics, Rectangle band, byte[] frame) {
+    if (frame.All(component => component == 0)) return;
+    var palette = new Color[NUM_LED + 2];
+    var positions = new float[NUM_LED + 2];
+    for (int i = 0; i < NUM_LED; i++) {
+      palette[i + 1] = Color.FromArgb(frame[i * 3], frame[i * 3 + 1], frame[i * 3 + 2]);
+      positions[i + 1] = (i + .5f) / NUM_LED;
+    }
+    palette[0] = palette[1];
+    palette[palette.Length - 1] = palette[palette.Length - 2];
+    positions[positions.Length - 1] = 1;
+    PaintPadBand(graphics, band, palette, positions);
+  }
+
+  static void PaintPadBand(Graphics graphics, Rectangle band, Color[] colors, float[] positions) {
+    using (var shape = RoundedPath(band, Math.Max(1, band.Height / 2)))
+    using (var brush = new System.Drawing.Drawing2D.LinearGradientBrush(band, Color.Black, Color.Black, 0f)) {
+      brush.InterpolationColors = new System.Drawing.Drawing2D.ColorBlend { Colors = colors, Positions = positions };
+      graphics.FillPath(brush, shape);
+    }
+  }
+}
+
+static TableLayoutPanel GraphiteGrid(int columns, int railRadius = 0) {
+  TableLayoutPanel panel = railRadius == 0 ? new TableLayoutPanel() : new RoundedRail(railRadius);
+  panel.AutoSize = true;
+  panel.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+  panel.ColumnCount = columns;
+  panel.Margin = Padding.Empty;
+  panel.GrowStyle = TableLayoutPanelGrowStyle.AddRows;
   for (int i = 0; i < columns; i++)
     panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f / columns));
   return panel;
+}
+
+sealed class RoundedRail : TableLayoutPanel {
+  readonly int radius;
+
+  public RoundedRail(int radius) {
+    this.radius = radius;
+    BackColor = GraphiteBackground;
+    DoubleBuffered = true;
+    ResizeRedraw = true;
+  }
+
+  public void PaintCapsule(Graphics graphics) {
+    PaintSurface(graphics, new Rectangle(1, 1, Width - 3, Height - 3), radius, GraphitePanel, SurfaceEdge);
+  }
+
+  protected override void OnPaint(PaintEventArgs e) {
+    base.OnPaint(e);
+    PaintCapsule(e.Graphics);
+  }
 }
 
 static void GraphiteAdd(TableLayoutPanel grid, Control control, int column = 0, int row = -1) {
@@ -1715,12 +1958,41 @@ static void GraphiteAdd(TableLayoutPanel grid, Control control, int column = 0, 
   grid.Controls.Add(control, column, row);
 }
 
-static TableLayoutPanel GraphiteCard(string title) {
-  TableLayoutPanel card = GraphiteGrid(1);
-  card.BackColor = GraphitePanel;
-  card.Padding = new Padding(11, 8, 11, 3);
-  GraphiteAdd(card, GraphiteText(title, 13, Color.White));
-  return card;
+static readonly Color PrimaryButtonFill = Color.FromArgb(120, 61, 218);
+
+static void UsePrimaryButton(RoundedButton button) {
+  button.FillColor = PrimaryButtonFill;
+  button.ForeColor = Color.White;
+  button.FlatAppearance.BorderSize = 0;
+}
+
+static Panel WorkspacePage() {
+  return new Panel { AutoScroll = true, Dock = DockStyle.Fill, Padding = new Padding(0, 4, 8, 4) };
+}
+
+static void OutlineSurface(Control surface, int radius, int highlight = 18) {
+  surface.BackColor = Color.Transparent;
+  surface.Resize += delegate { surface.Invalidate(); };
+  surface.Paint += delegate(object sender, PaintEventArgs e) {
+    PaintSurface(e.Graphics, new Rectangle(1, 1, surface.Width - 3, surface.Height - 3),
+                 radius, GraphitePanel, SurfaceEdge, highlight);
+  };
+}
+
+static void PaintSurface(Graphics graphics, Rectangle bounds, int radius, Color fill, Color edge, int highlight = 18) {
+  if (bounds.Width < 2 || bounds.Height < 2) return;
+  graphics.SmoothingMode = SmoothingMode.AntiAlias;
+  using (var shape = RoundedPath(bounds, radius))
+  using (var baseFill = new SolidBrush(fill)) {
+    graphics.FillPath(baseFill, shape);
+    if (highlight > 0) {
+      using (var light = new LinearGradientBrush(bounds, Color.FromArgb(highlight, 167, 119, 234), Color.Transparent, 90f))
+        graphics.FillPath(light, shape);
+    }
+    if (!edge.IsEmpty) {
+      using (var outline = new Pen(edge)) graphics.DrawPath(outline, shape);
+    }
+  }
 }
 
 static Label GraphiteText(string text, float size, Color color) {
@@ -1731,36 +2003,152 @@ static Label GraphiteText(string text, float size, Color color) {
 }
 
 static Label AddTemperature(TableLayoutPanel parent, string name, int column) {
-  TableLayoutPanel group = GraphiteGrid(2);
-  group.Margin = new Padding(5);
-  group.Padding = new Padding(10, 6, 10, 5);
-  group.BackColor = GraphitePanel;
-  Label title = GraphiteText(name, 12, Color.Silver);
-  title.TextAlign = ContentAlignment.MiddleLeft;
+  TableLayoutPanel group = GraphiteGrid(1);
+  group.Margin = new Padding(2, 0, 2, 0);
+  group.Padding = new Padding(3, 8, 3, 0);
+  Label title = GraphiteText(name, 8.5f, WorkspaceMuted);
+  title.AutoSize = false;
+  title.Height = title.Font.Height + 4;
+  title.AutoEllipsis = true;
+  title.TextAlign = ContentAlignment.MiddleCenter;
   GraphiteAdd(group, title, 0, 0);
-  Label value = GraphiteText("--", 22, GraphiteAccent);
-  value.AccessibleName = name + " temperature";
-  value.TextAlign = ContentAlignment.MiddleRight;
-  GraphiteAdd(group, value, 1, 0);
+  Label value = GraphiteText("—", 13, GraphiteAccent);
+  value.AutoSize = false;
+  value.Height = value.Font.Height + 4;
+  value.AutoEllipsis = true;
+  value.AccessibleName = name == "Fan command" ? "Commanded fan speed" : name + " temperature";
+  value.TextAlign = ContentAlignment.MiddleCenter;
+  GraphiteAdd(group, value, 0, 1);
   GraphiteAdd(parent, group, column, 0);
   group.Dock = DockStyle.Fill;
-  title.Dock = value.Dock = DockStyle.Fill;
   return value;
 }
 
-static Button GraphiteButton(string text) {
-  Button button = new Button {
-    Height = 34, Margin = Padding.Empty, Text = text, FlatStyle = FlatStyle.Flat,
-    BackColor = GraphitePanel, ForeColor = Color.White, Cursor = Cursors.Hand,
+static System.Drawing.Drawing2D.GraphicsPath RoundedPath(Rectangle bounds, int radius) {
+  var path = new System.Drawing.Drawing2D.GraphicsPath();
+  int diameter = Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height));
+  path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+  path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+  path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+  path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+  path.CloseFigure();
+  return path;
+}
+
+class RoundedButton : Button {
+  public bool Quiet;
+  public bool Radio, RadioSelected;
+  public int CornerRadius;
+  Color fillColor = GraphitePanel;
+  bool hovered;
+
+  public Color FillColor {
+    get { return fillColor; }
+    set { fillColor = value; Invalidate(); }
+  }
+
+  public RoundedButton() {
+    SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+             ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    BackColor = GraphiteBackground;
+  }
+
+  protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hovered = true; Invalidate(); }
+  protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hovered = false; Invalidate(); }
+
+  void PaintButtonBackground(Graphics graphics) {
+    graphics.Clear(Parent == null ? GraphiteBackground : Parent.BackColor);
+    var rail = Parent as RoundedRail;
+    if (rail == null) return;
+    var state = graphics.Save();
+    graphics.TranslateTransform(-Left, -Top);
+    rail.PaintCapsule(graphics);
+    graphics.Restore(state);
+  }
+
+  protected override void OnPaint(PaintEventArgs e) {
+    PaintButtonBackground(e.Graphics);
+    var bounds = new Rectangle(2, 2, Width - 5, Height - 5);
+    if (bounds.Width < 2 || bounds.Height < 2) return;
+    bool highlight = hovered && Enabled;
+    bool focus = Focused && ShowFocusCues;
+    if (!Quiet || highlight || focus) {
+      Color fill = Enabled ? FillColor : GraphitePanel;
+      if (highlight) fill = ControlPaint.Light(fill, .12f);
+      Color edge = focus ? WorkspaceText : FlatAppearance.BorderSize > 0 ? FlatAppearance.BorderColor : Color.Empty;
+      PaintSurface(e.Graphics, bounds, CornerRadius > 0 ? CornerRadius : bounds.Height / 2, fill, edge);
+    }
+    Rectangle text = Rectangle.Inflate(bounds, -4, -1);
+    TextFormatFlags align = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter;
+    if (Image != null && TextImageRelation == TextImageRelation.ImageAboveText) {
+      int top = Math.Max(2, (Height - Image.Height - Font.Height - 5) / 2);
+      e.Graphics.DrawImage(Image, (Width - Image.Width) / 2, top);
+      text.Y = top + Image.Height + 3;
+      text.Height = Height - text.Y - 4;
+    } else if (Image != null && TextImageRelation == TextImageRelation.ImageBeforeText) {
+      int left = Math.Max(4, (Width - Image.Width - TextRenderer.MeasureText(Text, Font).Width) / 2);
+      var icon = new Rectangle(left, (Height - Image.Height) / 2, Image.Width, Image.Height);
+      if (ForeColor == GraphiteBackground) {
+        using (var tint = new System.Drawing.Imaging.ImageAttributes()) {
+          tint.SetRemapTable(new[] { new System.Drawing.Imaging.ColorMap { OldColor = Color.Silver, NewColor = GraphiteBackground } });
+          e.Graphics.DrawImage(Image, icon, 0, 0, Image.Width, Image.Height, GraphicsUnit.Pixel, tint);
+        }
+      } else e.Graphics.DrawImage(Image, icon);
+      text.X = left + Image.Width;
+      text.Width = Width - text.X - 4;
+      align = TextFormatFlags.Left | TextFormatFlags.VerticalCenter;
+    } else if (TextAlign == ContentAlignment.MiddleLeft) {
+      text.X += 6;
+      text.Width -= 6;
+      align = TextFormatFlags.Left | TextFormatFlags.VerticalCenter;
+    }
+    if (Radio) {
+      int y = Height / 2;
+      e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+      using (var ring = new Pen(RadioSelected ? GraphiteAccent : WorkspaceMuted))
+        e.Graphics.DrawEllipse(ring, 11, y - 5, 10, 10);
+      if (RadioSelected)
+        using (var dot = new SolidBrush(GraphiteAccent)) e.Graphics.FillEllipse(dot, 14, y - 2, 4, 4);
+      text.X += 15;
+      text.Width -= 15;
+    }
+    TextRenderer.DrawText(e.Graphics, Text, Font, text, Enabled ? ForeColor : Color.Gray,
+                          align | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine |
+                          TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+  }
+}
+
+static RoundedButton GraphiteButton(string text) {
+  var button = new RoundedButton {
+    Height = 38, Margin = Padding.Empty, Text = text, FlatStyle = FlatStyle.Flat,
+    ForeColor = Color.White, Cursor = Cursors.Hand,
     UseVisualStyleBackColor = false
   };
-  button.FlatAppearance.BorderColor = GraphiteBorder;
+  button.FlatAppearance.BorderColor = SurfaceEdge;
   return button;
 }
 
 sealed class InstrumentSlider : TrackBar {
+  const int MouseWheelMessage = 0x020A;
+  int pendingWheelDelta;
+
   public InstrumentSlider() {
-    SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+             ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+  }
+
+  protected override void WndProc(ref Message message) {
+    if (message.Msg == MouseWheelMessage) {
+      // Consume wheel input here so the native trackbar cannot move or paint its own thumb.
+      pendingWheelDelta += unchecked((short)(message.WParam.ToInt64() >> 16));
+      int detent = SystemInformation.MouseWheelScrollDelta;
+      int steps = pendingWheelDelta / detent;
+      pendingWheelDelta %= detent;
+      if (steps != 0) Value = Math.Max(Minimum, Math.Min(Maximum, Value + steps * SmallChange));
+      message.Result = IntPtr.Zero;
+      return;
+    }
+    base.WndProc(ref message);
   }
 
   protected override void OnValueChanged(EventArgs e) {
@@ -1769,21 +2157,23 @@ sealed class InstrumentSlider : TrackBar {
   }
 
   protected override void OnPaint(PaintEventArgs e) {
-    base.OnPaint(e);
+    e.Graphics.Clear(BackColor);
     e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
     const int left = 12;
     int width = Math.Max(0, ClientSize.Width - left * 2);
     int y = ClientSize.Height / 2;
     float thumb = left + width * (Value - Minimum) / (float)(Maximum - Minimum);
-    using (Pen rail = new Pen(GraphiteBorder, 5))
+    var handle = new RectangleF(thumb - 7, y - 7, 14, 14);
+    using (Pen rail = new Pen(SurfaceEdge, 6))
     using (Pen progress = new Pen(GraphiteAccent, 5))
-    using (Brush fill = new SolidBrush(GraphiteAccent)) {
+    using (Brush shadow = new SolidBrush(Color.FromArgb(90, Color.Black)))
+    using (Brush fill = new LinearGradientBrush(handle, Color.FromArgb(197, 228, 255), GraphiteAccent, 90f)) {
       rail.StartCap = rail.EndCap = System.Drawing.Drawing2D.LineCap.Round;
       progress.StartCap = progress.EndCap = System.Drawing.Drawing2D.LineCap.Round;
       e.Graphics.DrawLine(rail, left, y, left + width, y);
       e.Graphics.DrawLine(progress, left, y, thumb, y);
-      e.Graphics.FillEllipse(fill, thumb - 7, y - 7, 14, 14);
-      e.Graphics.DrawEllipse(Pens.White, thumb - 7, y - 7, 14, 14);
+      e.Graphics.FillEllipse(shadow, thumb - 9, y - 6, 18, 18);
+      e.Graphics.FillEllipse(fill, handle);
     }
     if (Focused && ShowFocusCues) ControlPaint.DrawFocusRectangle(e.Graphics, ClientRectangle);
   }
@@ -1809,8 +2199,42 @@ static TrackBar AddSlider(TableLayoutPanel grid, string name, int min, int max, 
   return slider;
 }
 
+sealed class GraphiteToggle : CheckBox {
+  public Image Icon;
+
+  protected override void Dispose(bool disposing) {
+    if (disposing && Icon != null) Icon.Dispose();
+    base.Dispose(disposing);
+  }
+  protected override void OnCheckedChanged(EventArgs e) {
+    base.OnCheckedChanged(e);
+    Invalidate();
+  }
+
+  protected override void OnPaint(PaintEventArgs e) {
+    e.Graphics.Clear(Parent == null ? GraphiteBackground : Parent.BackColor);
+    e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+    var track = new Rectangle(Width - 39, (Height - 20) / 2, 36, 20);
+    if (track.Left < 0) return;
+    PaintSurface(e.Graphics, track, 10, Checked ? PrimaryButtonFill : GraphitePanel, SurfaceEdge);
+    int thumbX = Checked ? track.Right - 17 : track.Left + 3;
+    var knob = new Rectangle(thumbX, track.Top + 3, 14, 14);
+    using (var fill = new LinearGradientBrush(knob, Color.White, Checked ? WorkspaceText : WorkspaceMuted, 90f))
+      e.Graphics.FillEllipse(fill, knob);
+    int left = 3;
+    if (Icon != null) {
+      e.Graphics.DrawImage(Icon, new Rectangle(4, (Height - 22) / 2, 22, 22));
+      left = 38;
+    }
+    TextRenderer.DrawText(e.Graphics, Text, Font, new Rectangle(left, 0, Math.Max(0, track.Left - left), Height),
+                          Enabled ? ForeColor : Color.Gray, TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                          TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+    if (Focused && ShowFocusCues) ControlPaint.DrawFocusRectangle(e.Graphics, ClientRectangle);
+  }
+}
+
 static CheckBox AddCheck(TableLayoutPanel grid, string text) {
-  CheckBox check = new CheckBox { Text = text, AutoSize = true, Margin = Padding.Empty };
+  CheckBox check = new GraphiteToggle { Text = text, Height = 34, Margin = Padding.Empty, Cursor = Cursors.Hand };
   GraphiteAdd(grid, check);
   return check;
 }
@@ -1845,49 +2269,32 @@ static void FanSliderChanged(object s, EventArgs e) {
 static void BriSliderChanged(object s, EventArgs e) {
   if (dashSyncing) return;
   int v = tbBri.Value;
-  lock (cfgLock) { bri = v; }
+  SetLightingBrightness(v);
   ledDirty = true; SaveConfig();
+  CheckGroup(briItems, v.ToString());
   if (lblBriVal != null) lblBriVal.Text = v.ToString() + "%";
-}
-static void LedComboChanged(object s, EventArgs e) {
-  if (dashSyncing) return;
-  string v = cbLed.SelectedItem == null ? "heatmap" : cbLed.SelectedItem.ToString();
-  lock (cfgLock) {
-    if (v == "static") { led = "static"; } else led = v;
-  }
-  ledDirty = true; SaveConfig();
-  string tagSel = v == "static" ? "static:" + ledColor : v;
-  foreach (var it in ledItems) {
-    string t = (string)it.Tag;
-    string bt = t.StartsWith("static:") ? "static" : t;
-    string lt = led == "static" ? "static:" + ledColor : led;
-    it.Checked = (bt == "static") ? string.Equals(t, lt, StringComparison.OrdinalIgnoreCase)
-                                  : string.Equals(bt, led, StringComparison.OrdinalIgnoreCase);
-  }
-  LayoutColors();
+  if (lightingPreview != null) lightingPreview.Invalidate();
 }
 static void SmoothChanged(object s, EventArgs e) {
   if (dashSyncing) return;
-  try { ApplySmooth(tbSmooth.Value); } catch { }
-  SyncDash();
+  ApplySmooth(tbSmooth.Value);
+  lblSmoothVal.Text = smooth + "%";
+  dashSyncing = true;
+  try { ckSteady.Checked = deadband > 0 && downHold > 1; }
+  finally { dashSyncing = false; }
   SaveConfig();
-}
-static void LayoutColors() {
-  foreach (var swatch in colorSwatches) {
-    bool selected = led == "static" && string.Equals(ledColor, swatch.Key, StringComparison.OrdinalIgnoreCase);
-    swatch.Value.FlatAppearance.BorderColor = selected ? Color.White : GraphiteBorder;
-    swatch.Value.FlatAppearance.BorderSize = selected ? 3 : 1;
-  }
 }
 static void SyncDash() {
   if (dash == null || dash.IsDisposed) return;
   try {
     dashSyncing = true;
-    foreach (Button button in profBtns) {
-      bool selected = manual ? button.Text == "Manual" :
-        string.Equals(prof, button.Text, StringComparison.OrdinalIgnoreCase);
-      button.BackColor = selected ? Color.FromArgb(47, 67, 19) : GraphitePanel;
-      button.FlatAppearance.BorderColor = selected ? GraphiteAccent : GraphiteBorder;
+    foreach (RoundedButton button in profBtns) {
+      string key = (string)button.Tag;
+      bool selected = manual ? key == "manual" : string.Equals(prof, key, StringComparison.OrdinalIgnoreCase);
+      button.Quiet = !selected;
+      button.RadioSelected = selected;
+      button.FillColor = selected ? Color.FromArgb(45, 32, 75) : GraphitePanel;
+      button.FlatAppearance.BorderColor = selected ? GraphiteAccent : SurfaceEdge;
       button.ForeColor = selected ? GraphiteAccent : Color.White;
       button.AccessibleDescription = selected ? "Selected fan profile" : "";
     }
@@ -1900,9 +2307,8 @@ static void SyncDash() {
     ckSteady.Visible = automatic;
     tbFan.Value = Math.Max(MIN_UNIT, Math.Min(MAX_UNIT, manualUnit));
     lblFanVal.Text = (manualUnit * FACTOR).ToString("N0") + " RPM";
-    int effect = cbLed.Items.IndexOf(led);
-    cbLed.SelectedIndex = effect;
-    LayoutColors();
+    lightingGallery.SyncSelection();
+    lightingPreview.Invalidate();
     if (tbBri != null && tbBri.Value != bri) tbBri.Value = Math.Max(0, Math.Min(100, bri));
     if (lblBriVal != null) lblBriVal.Text = bri.ToString() + "%";
     if (ckAutoTurbo != null) ckAutoTurbo.Checked = autoTurbo;
@@ -1967,10 +2373,20 @@ static void DashTick(object sender, EventArgs e) {
   int cpu = curCpu, gpu = curGpu, rpm = curRpm;
   lblCpu.Text = cpu < 0 ? "--" : cpu + " °C";
   lblGpu.Text = gpu < 0 ? "--" : gpu + " °C";
-  speedMeter.AccessibleDescription = rpm < 0 ? "Speed unavailable" : rpm.ToString("N0") + " RPM";
-  speedMeter.Invalidate();
+  lblRpm.Text = rpm < 0 ? "— RPM" : rpm.ToString("N0") + " RPM";
   bool connected = devH != new IntPtr(-1);
-  lblHead.Text = connected ? "USB connected" : "USB disconnected";
+  lblHead.Text = connected ? "●  USB connected" : "○  USB disconnected";
+  lblHead.ForeColor = connected ? Color.FromArgb(126, 228, 168) : WorkspaceMuted;
+  deviceConnection.Text = connected ? "●  USB connected" : "○  USB disconnected";
+  deviceConnection.ForeColor = lblHead.ForeColor;
+  LightingOutput output = lightingOutput;
+  if (!connected) lightingStatus.Text = "Lighting preview unavailable · USB disconnected";
+  else if (output == null) lightingStatus.Text = "Waiting for the pad’s lighting response…";
+  else if (output.Frame == null) lightingStatus.Text = "Lighting unconfirmed · retrying";
+  else if (output.Note == "Paused") lightingStatus.Text = "USB confirmed · lighting paused";
+  else if (output.Off && output.Note.Length == 0) lightingStatus.Text = "USB confirmed · lights off";
+  else lightingStatus.Text = "USB confirmed · " + output.Brightness + "%" +
+      (output.Note.Length == 0 ? "" : " (" + output.Note + ")");
   int now = Environment.TickCount, deadline = Volatile.Read(ref manualTurboUntil);
   int seconds = NotExpired(now, deadline) ? (unchecked(deadline - now) + 999) / 1000 : 0;
   btnTurbo.Enabled = !paused && connected;
@@ -2001,8 +2417,13 @@ static string DefaultStatusPath() {
 static void WriteStatus() {
   if (statusFilePath == null) return;
   try {
+    LightingOutput output = lightingOutput;
+    string lighting = output == null ? "pending" : output.Frame == null ? "retrying" : "confirmed";
+    string frame = output == null || output.Frame == null ? "" :
+      " ledbri=" + output.Brightness + " ledframe=" + BitConverter.ToString(output.Frame).Replace("-", "");
     string txt = "ts=" + DateTime.Now.ToString("HH:mm:ss") + " paused=" + paused + " profile=" + prof + " led=" + led + " bri=" + bri +
-      " cpu=" + curCpu + " gpu=" + curGpu + " unit=" + curUnit + " rpm=" + curRpm + " | " + curStatus;
+      " cpu=" + curCpu + " gpu=" + curGpu + " unit=" + curUnit + " rpm=" + curRpm +
+      " ledsync=" + lighting + frame + " | " + curStatus;
     File.WriteAllText(statusFilePath, txt);
   } catch { }
 }
@@ -2068,13 +2489,16 @@ static void Main(string[] args) {
   foreach (string a0 in args) { if (a0.ToLowerInvariant() == "--status") { StatusPrint(); return; } }
   for (int i = 0; i < args.Length; i++) { if (args[i].ToLowerInvariant() == "--status-file" && i + 1 < args.Length) statusFilePath = args[++i]; }
 
-  // single-instance guard: if another tray is already running, this one quietly retires
+  const string dashboardEventName = "RazerPadTray_OpenDashboard";
+  // A second launch can open the window without starting a second controller.
+  var dashboardRequest = new EventWaitHandle(false, EventResetMode.AutoReset, dashboardEventName);
   bool createdNew = false;
   Mutex single = null;
   try { single = new Mutex(true, "RazerPadTray_SingleInstance", out createdNew); } catch { }
   if (single != null && !createdNew) {
-    try { tray = new NotifyIcon(); tray.Visible = false; tray.Dispose(); } catch { }
-    if (single != null) { try { single.Close(); } catch { } }
+    if (openOnStart) dashboardRequest.Set();
+    dashboardRequest.Dispose();
+    single.Dispose();
     return;
   }
 
@@ -2110,6 +2534,12 @@ static void Main(string[] args) {
   uiTimer.Interval = 1200;
   uiTimer.Tick += new EventHandler(UiTick);
   uiTimer.Start();
+  var dashboardRequestTimer = new System.Windows.Forms.Timer { Interval = 150 };
+  dashboardRequestTimer.Tick += delegate {
+    if (!dashboardRequest.WaitOne(0)) return;
+    try { ShowDashboard(); } catch (Exception ex) { LogCrash("open-request: " + ex.Message); }
+  };
+  dashboardRequestTimer.Start();
   if (openOnStart) { try { ShowDashboard(); } catch (Exception oex) { try { LogCrash("open-on-start: " + oex.Message); } catch { } } }
 
   worker = new Thread(new ThreadStart(WorkerLoop));
@@ -2139,6 +2569,8 @@ static void Main(string[] args) {
 
   try { if (hyperBoost) ApplyHyperBoost(true); } catch { }
   Application.Run();
+  dashboardRequestTimer.Dispose();
+  dashboardRequest.Dispose();
 
   // ---------- cleanup on exit ----------
   _run = false;
@@ -2171,7 +2603,7 @@ static void Main(string[] args) {
         try { SetFanSpeed(devH, fanId, rest); } catch { }
         try { SetFanMode(devH, fanId, 0); } catch { }   // restore onboard "Auto" mode
       }
-      try { MatrixOff(devH); } catch { }
+      try { lock (hidLock) WriteChroma(devH, ChromaEffect, ChromaOff); } catch { }
       CloseHandle(devH);
       devH = new IntPtr(-1);
     }
